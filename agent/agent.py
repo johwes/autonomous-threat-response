@@ -85,6 +85,9 @@ IMPORTANT — linux tool parameters:
 - Do NOT pass a "host" parameter to linux tools. The tools already run directly on
   the target RHEL VM (linux-mcp-server is spawned there via SSH). Passing "host"
   causes a second SSH hop to a potentially stale IP and will fail.
+- For get_journal_logs "since": use relative format only, e.g. "-1h", "-30m", "-2h".
+  Do NOT use ISO 8601 timestamps (e.g. "2026-08-13T06:00:00Z") — journalctl will
+  reject them and the tool will return an error.
 - Call tools with only the parameters they need (e.g. pid, since, lines).
 
 DO NOT write the incident report until you have called tools and seen their output.
@@ -360,11 +363,17 @@ def _strip_host_param(tool):
         for name, info in fields.items()
         if name != "host"
     }
-    NewSchema = create_model(schema.__name__ + "_nohost", **new_fields)
+    # model_config = ConfigDict(extra="ignore") so Pydantic silently drops any
+    # extra fields (including a hallucinated 'host') before they reach _arun.
+    from pydantic import ConfigDict
+    NewSchema = create_model(
+        schema.__name__ + "_nohost",
+        __config__=type("Config", (), {"extra": "ignore"}),
+        **new_fields,
+    )
 
-    # Delegate to the original MCP tool without the host param.
-    # We filter host here too (not just from the schema) because gpt-oss-120b
-    # hallucinates it from training memory even when it's absent from the schema.
+    # Belt-and-suspenders: also pop 'host' at call time in case the model
+    # bypasses schema validation somehow.
     async def _arun(**kwargs):
         kwargs.pop("host", None)
         return await tool.arun(kwargs)
