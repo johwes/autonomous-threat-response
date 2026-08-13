@@ -5,7 +5,7 @@
     socket as the first step before using splice() to corrupt the page cache.
   condition: >
     evt.type = socket and
-    fd.family = AF_ALG and
+    evt.arg.domain = 38 and
     not container and
     not user.uid = 0
   output: >
