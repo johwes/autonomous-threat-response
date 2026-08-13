@@ -270,16 +270,53 @@ class ThreatResponseAgent:
                 recommended_next_steps=["Manually investigate the Falco alert on the host"],
             )
 
-        # --- Phase 2: call the LLM directly (not the ReAct graph) to write the report ---
-        # We skip the graph here intentionally: the investigation is complete, no more tool calls
-        # are needed, and re-entering the graph could trigger another tool-calling round that
-        # interleaves with report generation. A direct LLM call is cheaper and more reliable.
+        # --- Phase 2: call the LLM directly with a clean summary of tool findings ---
+        # We do NOT pass final_messages back to the LLM. The graph history contains
+        # model-specific special tokens (<|channel|>commentary<|message|>) that confuse
+        # the model when replayed as context and cause it to return empty responses.
+        # Instead, extract the ToolMessages from the history and build a clean summary.
         ilog.info("phase2.start", msg="Requesting structured report from agent")
-        report_messages = final_messages + [HumanMessage(content=report_request)]
+
+        tool_findings = []
+        for msg in final_messages:
+            # ToolMessages have a 'name' attribute and represent tool call results
+            msg_type = type(msg).__name__
+            if msg_type == "ToolMessage" or (hasattr(msg, "name") and hasattr(msg, "tool_call_id")):
+                tool_name = getattr(msg, "name", "unknown")
+                content = msg.content
+                # content may be a string or a list of content blocks
+                if isinstance(content, list):
+                    text_parts = [
+                        c.get("text", "") if isinstance(c, dict) else str(c)
+                        for c in content
+                    ]
+                    content = "\n".join(text_parts)
+                tool_findings.append(f"[{tool_name}]:\n{str(content)[:2000]}")
+
+        findings_text = "\n\n".join(tool_findings) if tool_findings else "No tool output captured."
+
+        phase2_messages = [
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=(
+                f"Investigation complete for incident {incident_id}.\n\n"
+                f"TOOL FINDINGS FROM INVESTIGATION:\n{findings_text}\n\n"
+                f"{report_request}"
+            )),
+        ]
 
         ilog.info("llm.thinking", model="phase2")
-        phase2_response = await self._llm.ainvoke(report_messages)
-        final_content = phase2_response.content if hasattr(phase2_response, "content") else str(phase2_response)
+        phase2_response = await self._llm.ainvoke(phase2_messages)
+        raw_content = phase2_response.content if hasattr(phase2_response, "content") else str(phase2_response)
+        # Some models return content as a list of blocks; extract text
+        if isinstance(raw_content, list):
+            raw_content = "\n".join(
+                c.get("text", "") if isinstance(c, dict) else str(c)
+                for c in raw_content
+            )
+        # Strip model-specific channel tokens (e.g. gpt-oss-120b uses <|channel|>...<|message|>)
+        if "<|message|>" in raw_content:
+            raw_content = raw_content.split("<|message|>", 1)[-1]
+        final_content = raw_content
         ilog.info("llm.response", preview=str(final_content)[:300])
         ilog.info("phase2.complete")
 
@@ -372,10 +409,15 @@ def _strip_host_param(tool):
         **new_fields,
     )
 
-    # Belt-and-suspenders: also pop 'host' at call time in case the model
-    # bypasses schema validation somehow.
     async def _arun(**kwargs):
         kwargs.pop("host", None)
+        # Normalise 'since' timestamp: linux-mcp-server's journalctl wrapper
+        # accepts "YYYY-MM-DD HH:MM:SS" or relative ("-1h") but rejects ISO 8601
+        # with a Z suffix. Strip the T and Z to get the accepted format.
+        if "since" in kwargs and isinstance(kwargs["since"], str):
+            s = kwargs["since"]
+            if "T" in s:
+                kwargs["since"] = s.replace("T", " ").rstrip("Z")
         return await tool.arun(kwargs)
 
     return StructuredTool.from_function(
