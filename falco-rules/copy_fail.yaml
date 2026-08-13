@@ -42,7 +42,8 @@
   condition: >
     spawned_process and
     proc.pname in (su, sudo, newgrp, passwd, mount, umount) and
-    user.uid = 0
+    user.uid = 0 and
+    not proc.name in (unix_chkpwd, unix2_chkpwd, pam_tally2, pam_tally, faillock, systemd-user-sessions)
   output: >
     Setuid binary spawned root shell — possible LPE via page cache corruption
     (user=%user.name uid=%user.uid pid=%proc.pid
