@@ -1,0 +1,22 @@
+# ClusterIP Service that gives the RHEL VM a stable DNS name for SSH.
+# KubeVirt assigns the VM a new pod IP on every restart; this Service
+# uses the vm.kubevirt.io/name label to track it automatically.
+#
+# DNS name (in-cluster): rhel9-brown-loon-92-ssh.rhn-sa-jwesterl-dev.svc.cluster.local
+# Short form (same namespace): rhel9-brown-loon-92-ssh
+apiVersion: v1
+kind: Service
+metadata:
+  name: rhel9-brown-loon-92-ssh
+  namespace: rhn-sa-jwesterl-dev
+  labels:
+    app: threat-response-agent
+spec:
+  selector:
+    vm.kubevirt.io/name: rhel9-brown-loon-92
+  ports:
+    - name: ssh
+      port: 22
+      targetPort: 22
+      protocol: TCP
+  type: ClusterIP
