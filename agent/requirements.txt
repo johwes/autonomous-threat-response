@@ -1,0 +1,19 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.9.0
+
+# LangGraph + LangChain
+langgraph>=0.2.50
+langchain>=0.3.10
+langchain-anthropic>=0.3.0
+langchain-openai>=0.3.0
+langchain-core>=0.3.20
+
+# MCP client support for LangGraph
+langchain-mcp-adapters>=0.1.0
+
+# HTTP client (for AAP REST fallback)
+httpx>=0.28.0
+
+# Structured logging
+structlog>=24.4.0

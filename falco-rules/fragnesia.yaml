@@ -1,0 +1,63 @@
+- rule: Fragnesia User Namespace Creation by Unprivileged Process
+  desc: >
+    Detects an unprivileged process calling unshare() or clone() with
+    CLONE_NEWUSER to create a new user namespace. CVE-2026-46300 (Fragnesia)
+    uses user namespaces to gain CAP_NET_ADMIN without host privileges,
+    which is required to open the XFRM ESP-in-TCP socket.
+  condition: >
+    evt.type in (unshare, clone) and
+    not user.uid = 0 and
+    (evt.arg.flags contains CLONE_NEWUSER or evt.arg.namespaces contains user)
+  output: >
+    User namespace created by unprivileged process — possible Fragnesia exploit setup
+    (user=%user.name uid=%user.uid pid=%proc.pid
+     comm=%proc.name parent=%proc.pname cmdline=%proc.cmdline
+     container=%container.name)
+  priority: WARNING
+  tags: [CVE-2026-46300, fragnesia, lpe, namespace, page_cache]
+
+- rule: Fragnesia ESP Module Loaded or Used by Unprivileged Process
+  desc: >
+    Detects an unprivileged process loading or interacting with esp4 or esp6
+    kernel modules. Fragnesia (CVE-2026-46300) requires the XFRM ESP subsystem
+    to trigger in-place decryption over page-cache-backed frags. Blacklisting
+    these modules is the recommended interim mitigation.
+  condition: >
+    evt.type in (init_module, finit_module) and
+    not user.uid = 0 and
+    (evt.arg.uargs contains "esp4" or evt.arg.uargs contains "esp6")
+  output: >
+    ESP kernel module loaded by unprivileged process — possible Fragnesia exploit
+    (user=%user.name uid=%user.uid pid=%proc.pid
+     comm=%proc.name parent=%proc.pname cmdline=%proc.cmdline
+     container=%container.name)
+  priority: ERROR
+  tags: [CVE-2026-46300, fragnesia, lpe, kernel_module, page_cache]
+
+- rule: Fragnesia GRO UDP Splice Pattern
+  desc: >
+    Detects the GRO variant of Fragnesia — an unprivileged process sending
+    large UDP datagrams that may be coalesced by Generic Receive Offload (GRO)
+    into page-cache-backed frags. Heuristic rule; tune threshold for environment.
+  condition: >
+    evt.type = sendmsg and
+    not user.uid = 0 and
+    fd.type = socket and
+    fd.sock.protocol = udp and
+    evt.arg.size > 65000
+  output: >
+    Large UDP sendmsg by unprivileged process — possible Fragnesia GRO variant
+    (user=%user.name uid=%user.uid pid=%proc.pid
+     comm=%proc.name parent=%proc.pname cmdline=%proc.cmdline
+     size=%evt.arg.size container=%container.name)
+  priority: WARNING
+  tags: [CVE-2026-46300, fragnesia, lpe, gro, page_cache]
+
+- rule: Setuid Binary Spawns Unexpected Root Shell
+  desc: >
+    See copy_fail.yaml — this shared indicator fires for both CVEs.
+    Defined once in copy_fail.yaml; listed here for reference only.
+  condition: "never"
+  output: "n/a"
+  priority: INFO
+  tags: [CVE-2026-46300, fragnesia, reference]

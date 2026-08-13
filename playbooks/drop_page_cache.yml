@@ -1,0 +1,33 @@
+---
+# Flush the page cache to evict any corrupted in-memory setuid binaries.
+# Forces the kernel to reload clean on-disk binaries on next execution.
+# Safe to run on a live system; may cause a brief I/O spike on reload.
+#
+# Extra vars expected:
+#   target_host: RHEL host to remediate
+
+- name: Drop page cache to evict corrupted in-memory binaries
+  hosts: "{{ target_host }}"
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Sync filesystem buffers to disk before cache drop
+      ansible.builtin.command:
+        cmd: sync
+      changed_when: false
+
+    - name: Drop page cache, dentries, and inodes
+      ansible.builtin.shell:
+        cmd: echo 3 > /proc/sys/vm/drop_caches
+      changed_when: true
+
+    - name: Confirm page cache was dropped
+      ansible.builtin.command:
+        cmd: cat /proc/sys/vm/drop_caches
+      register: cache_status
+      changed_when: false
+
+    - name: Report cache drop result
+      ansible.builtin.debug:
+        msg: "Page cache drop complete. /proc/sys/vm/drop_caches = {{ cache_status.stdout }}"

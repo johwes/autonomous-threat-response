@@ -1,0 +1,51 @@
+---
+# Terminate an escalated root shell process spawned via LPE exploit.
+# Kills the process tree rooted at the given PID to ensure child processes
+# (e.g. further shells, tools downloaded by the attacker) are also terminated.
+#
+# Extra vars expected:
+#   target_pid:  PID of the root shell process to terminate
+#   target_host: RHEL host to remediate
+
+- name: Kill escalated root shell process
+  hosts: "{{ target_host }}"
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Capture process info before kill (for audit trail)
+      ansible.builtin.command:
+        cmd: ps -p {{ target_pid }} -o pid,ppid,user,comm,args --no-headers
+      register: process_info
+      changed_when: false
+      ignore_errors: true
+
+    - name: Log process info
+      ansible.builtin.debug:
+        msg: "Terminating process: {{ process_info.stdout | default('process not found') }}"
+
+    - name: Kill process tree (SIGKILL)
+      ansible.builtin.command:
+        cmd: kill -9 -{{ target_pid }}
+      ignore_errors: true
+      changed_when: true
+
+    - name: Kill individual PID if process group kill failed
+      ansible.builtin.command:
+        cmd: kill -9 {{ target_pid }}
+      ignore_errors: true
+      changed_when: true
+
+    - name: Confirm process is no longer running
+      ansible.builtin.command:
+        cmd: ps -p {{ target_pid }}
+      register: ps_check
+      changed_when: false
+      failed_when: ps_check.rc == 0
+      ignore_errors: true
+
+    - name: Report termination result
+      ansible.builtin.debug:
+        msg: >
+          Process {{ target_pid }} termination complete.
+          Return code: {{ ps_check.rc }} (1 = process gone, 0 = still running)

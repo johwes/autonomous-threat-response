@@ -1,0 +1,22 @@
+# OpenShift Route — exposes the Falco webhook endpoint externally.
+# Falco's webhook output plugin points to:
+#   https://<route-host>/webhook
+#
+# TLS is edge-terminated at the OpenShift router; traffic inside the cluster
+# is plain HTTP.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: threat-response-agent
+  namespace: rhn-sa-jwesterl-dev
+  labels:
+    app: threat-response-agent
+spec:
+  to:
+    kind: Service
+    name: threat-response-agent
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

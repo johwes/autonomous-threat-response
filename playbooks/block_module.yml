@@ -1,0 +1,50 @@
+---
+# Blacklist the vulnerable kernel module to prevent re-exploitation.
+# For Copy Fail (CVE-2026-31431): module = algif_aead
+# For Fragnesia (CVE-2026-46300): module = esp4 or esp6
+#
+# Extra vars expected:
+#   kernel_module: name of the module to blacklist (e.g. algif_aead, esp4, esp6)
+#   target_host:   RHEL host to remediate
+
+- name: Blacklist vulnerable kernel module
+  hosts: "{{ target_host }}"
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Unload module if currently loaded
+      community.general.modprobe:
+        name: "{{ kernel_module }}"
+        state: absent
+      ignore_errors: true
+
+    - name: Add module to blacklist
+      ansible.builtin.lineinfile:
+        path: /etc/modprobe.d/security-blacklist.conf
+        line: "blacklist {{ kernel_module }}"
+        create: true
+        mode: "0644"
+
+    - name: Add install no-op to prevent auto-load
+      ansible.builtin.lineinfile:
+        path: /etc/modprobe.d/security-blacklist.conf
+        line: "install {{ kernel_module }} /bin/false"
+        create: true
+        mode: "0644"
+
+    - name: Regenerate initramfs to persist blacklist across reboots
+      ansible.builtin.command:
+        cmd: dracut --force
+      changed_when: true
+
+    - name: Confirm module is not loaded
+      ansible.builtin.command:
+        cmd: lsmod
+      register: lsmod_output
+      changed_when: false
+
+    - name: Fail if module is still loaded
+      ansible.builtin.fail:
+        msg: "Module {{ kernel_module }} is still loaded — manual intervention required"
+      when: kernel_module in lsmod_output.stdout

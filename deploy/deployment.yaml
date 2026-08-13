@@ -1,0 +1,107 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: threat-response-agent
+  namespace: rhn-sa-jwesterl-dev
+  labels:
+    app: threat-response-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: threat-response-agent
+  template:
+    metadata:
+      labels:
+        app: threat-response-agent
+    spec:
+      containers:
+        - name: agent
+          image: quay.io/YOURORG/threat-response-agent:latest
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          env:
+            # Model config — OpenAI-compatible endpoint (MaaS)
+            - name: AGENT_PROVIDER
+              value: "openai_compatible"
+            - name: AGENT_MODEL
+              value: "deepseek-r1-distill-qwen-14b"
+            - name: AGENT_BASE_URL
+              value: "https://maas-rhdp.apps.maas.redhatworkshops.io/v1"
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: threat-response-agent-secrets
+                  key: OPENAI_API_KEY
+            # linux-mcp-server — reached via SSH into the RHEL VM (stdio transport)
+            - name: LINUX_MCP_SSH_HOST
+              value: "10.128.1.141"  # rhel9-brown-loon-92 VM IP
+            - name: LINUX_MCP_SSH_USER
+              value: "cloud-user"
+            - name: LINUX_MCP_SSH_KEY_PATH
+              value: "/ssh/id_rsa"
+            - name: LINUX_MCP_CMD
+              value: "sudo /root/.local/bin/linux-mcp-server"
+            # AAP MCP server — streamable-HTTP transport
+            - name: AAP_MCP_URL
+              value: "https://sandbox-aap-mcp-rhn-sa-jwesterl-dev.apps.rm3.7wse.p1.openshiftapps.com/mcp"
+            # Secrets
+            - name: AAP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: threat-response-agent-secrets
+                  key: AAP_TOKEN
+            # LangSmith tracing — set LANGCHAIN_TRACING_V2=true and provide
+            # LANGCHAIN_API_KEY via the secret to enable the visual trace UI.
+            # Leave LANGCHAIN_TRACING_V2 as "false" to disable (no-op, no perf cost).
+            - name: LANGCHAIN_TRACING_V2
+              value: "false"
+            - name: LANGCHAIN_PROJECT
+              value: "autonomous-threat-response"
+            - name: LANGCHAIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: threat-response-agent-secrets
+                  key: LANGCHAIN_API_KEY
+                  optional: true
+          volumeMounts:
+            - name: rhel-ssh-key
+              mountPath: /ssh
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: rhel-ssh-key
+          secret:
+            secretName: agent-ssh-privkey
+            items:
+              - key: id_rsa
+                path: id_rsa
+                mode: 0600
+      restartPolicy: Always

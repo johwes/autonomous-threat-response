@@ -1,0 +1,388 @@
+"""
+LangGraph ReAct agent that investigates Falco alerts and triggers remediation.
+
+Investigation tools come from linux-mcp-server (read-only host introspection).
+Remediation tools come from Ansible Automation Platform MCP server.
+
+The agent is model-agnostic: swap AGENT_MODEL env var to use any LangChain
+chat model (Anthropic, OpenAI, Azure, Bedrock, etc.).
+
+Agent activity is streamed to stdout via astream_events() so that:
+  - `oc logs -f <pod>` gives a live play-by-play of every tool call and decision
+  - LangSmith tracing (LANGCHAIN_TRACING_V2=true) gives a visual trace UI
+"""
+
+import json
+import os
+from typing import Any, Literal
+
+import structlog
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.prebuilt import create_react_agent
+from pydantic import BaseModel, Field
+
+log = structlog.get_logger()
+
+# ---------------------------------------------------------------------------
+# Config (from environment)
+# ---------------------------------------------------------------------------
+
+AGENT_MODEL = os.getenv("AGENT_MODEL", "deepseek-r1-distill-qwen-14b")
+AGENT_BASE_URL = os.getenv("AGENT_BASE_URL", "https://maas-rhdp.apps.maas.redhatworkshops.io/v1")
+
+# linux-mcp-server — read-only RHEL introspection (stdio over SSH)
+# The server runs on the RHEL VM; we reach it by SSHing in and spawning it.
+LINUX_MCP_SSH_HOST = os.getenv("LINUX_MCP_SSH_HOST", "rhel-host")
+LINUX_MCP_SSH_USER = os.getenv("LINUX_MCP_SSH_USER", "root")
+LINUX_MCP_SSH_KEY = os.getenv("LINUX_MCP_SSH_KEY_PATH", "/ssh/id_rsa")
+LINUX_MCP_CMD = os.getenv("LINUX_MCP_CMD", "linux-mcp-server")
+
+# Ansible Automation Platform MCP server — remediation playbooks
+# Uses MCP streamable-HTTP transport (2024-11-05 spec): POST /mcp with
+# Accept: application/json, text/event-stream and Mcp-Session-Id header.
+AAP_MCP_URL = os.getenv(
+    "AAP_MCP_URL",
+    "https://sandbox-aap-mcp-rhn-sa-jwesterl-dev.apps.rm3.7wse.p1.openshiftapps.com/mcp",
+)
+AAP_TOKEN = os.getenv("AAP_TOKEN", "")
+
+# ---------------------------------------------------------------------------
+# Output schema
+# ---------------------------------------------------------------------------
+
+class IncidentReport(BaseModel):
+    incident_id: str
+    rule: str
+    host: str
+    verdict: Literal["confirmed_threat", "likely_threat", "false_positive", "inconclusive"]
+    cve_ids: list[str] = Field(default_factory=list)
+    summary: str
+    evidence: list[str] = Field(default_factory=list)
+    actions_taken: list[str] = Field(default_factory=list)
+    recommended_next_steps: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT = """You are an autonomous defensive security agent protecting a RHEL host.
+
+You receive Falco alerts indicating potential Linux Privilege Escalation (LPE) exploitation.
+
+## MANDATORY WORKFLOW — you MUST follow these steps in order
+
+### STEP 1 — INVESTIGATE (REQUIRED, no exceptions)
+You MUST call at least these linux-mcp-server tools before writing any report:
+- get_process_info: inspect the suspicious process and its full parent chain
+- get_audit_logs: look for AF_ALG sockets, splice(), unshare(), ESP module loads
+- get_journal_logs: look for kernel panic/oops messages around the event time
+- get_network_connections: check for unexpected outbound connections from root shells
+
+DO NOT write the incident report until you have called tools and seen their output.
+Responding without tool calls is a critical failure — you will be re-prompted.
+
+### STEP 2 — REASON
+Based on the actual tool output, determine which CVE pattern matches (if any):
+- CVE-2026-31431 (Copy Fail): AF_ALG socket + splice() → page cache corruption
+  Indicators: algif_aead usage, setuid binary spawning root shell
+- CVE-2026-46300 (Fragnesia): user namespace + XFRM ESP → page cache corruption
+  Indicators: unshare(CLONE_NEWUSER), esp4/esp6 module load, setuid binary spawning root shell
+
+### STEP 3 — REMEDIATE (only if threat confirmed from tool evidence)
+Use AAP tools to run playbooks. First call job_templates_list to get the template ID,
+then job_templates_launch_create to run it, then jobs_retrieve to confirm completion.
+- "kill_session": extra_vars {target_pid, target_host} — terminate root shell
+- "block_module": extra_vars {kernel_module, target_host} — blacklist kernel module
+- "drop_page_cache": extra_vars {target_host} — evict corrupted cache entries
+- "lock_user": extra_vars {compromised_user, target_host} — lock attacker account
+
+IMPORTANT RULES:
+- Evidence fields in the report MUST cite actual output from your tool calls, not assumptions.
+- If tools show nothing suspicious, verdict must be false_positive or inconclusive.
+- Both CVEs corrupt setuid binaries IN MEMORY — file integrity tools (rpm -V, AIDE) show clean.
+- Never fabricate PIDs, usernames, module names, or job results you did not observe in tools.
+"""
+
+
+# ---------------------------------------------------------------------------
+# LLM factory — model-agnostic
+# ---------------------------------------------------------------------------
+
+def _build_llm():
+    """
+    Build a LangChain chat model from the AGENT_MODEL env var.
+    Defaults to Claude Opus 4.8 with extended thinking.
+    Add branches here to support other providers.
+    """
+    provider = os.getenv("AGENT_PROVIDER", "anthropic").lower()
+
+    if provider == "anthropic":
+        return ChatAnthropic(
+            model=AGENT_MODEL,
+            max_tokens=16000,
+            thinking={"type": "adaptive"},
+            streaming=True,
+        )
+
+    if provider in ("openai", "openai_compatible"):
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=AGENT_MODEL,
+            base_url=AGENT_BASE_URL,
+            streaming=True,
+        )
+
+    if provider == "azure":
+        from langchain_openai import AzureChatOpenAI
+        return AzureChatOpenAI(
+            azure_deployment=AGENT_MODEL,
+            streaming=True,
+        )
+
+    if provider == "bedrock":
+        from langchain_aws import ChatBedrock
+        return ChatBedrock(model_id=AGENT_MODEL, streaming=True)
+
+    raise ValueError(f"Unknown AGENT_PROVIDER: {provider}")
+
+
+# ---------------------------------------------------------------------------
+# Agent construction (called once at startup)
+# ---------------------------------------------------------------------------
+
+class ThreatResponseAgent:
+    def __init__(self, graph, mcp_client: MultiServerMCPClient):
+        self._graph = graph
+        self._mcp_client = mcp_client
+
+    async def ainvoke(self, alert, incident_id: str) -> IncidentReport:
+        host = alert.output_fields.get("container.name") or alert.hostname or "unknown"
+        ilog = log.bind(incident_id=incident_id, host=host, rule=alert.rule)
+
+        # Phase 1 message: alert details ONLY — no mention of output format.
+        # Keeping the report template out of this message prevents the model from
+        # pattern-matching "fill in template → done" before calling any tools.
+        investigate_message = (
+            f"Falco alert received. Investigate now using your tools.\n\n"
+            f"**Alert Rule:** {alert.rule}\n"
+            f"**Priority:** {alert.priority}\n"
+            f"**Host:** {host}\n"
+            f"**Time:** {alert.time}\n"
+            f"**Tags:** {', '.join(alert.tags)}\n"
+            f"**Raw output:** {alert.output}\n"
+            f"**Output fields:**\n```json\n{json.dumps(alert.output_fields, indent=2)}\n```\n\n"
+            f"Incident ID: {incident_id}\n\n"
+            f"Follow the MANDATORY WORKFLOW from your instructions:\n"
+            f"1. Call get_process_info, get_audit_logs, get_journal_logs, get_network_connections\n"
+            f"2. Determine the CVE pattern from the evidence\n"
+            f"3. Remediate if confirmed (job_templates_list → job_templates_launch_create → jobs_retrieve)\n\n"
+            f"Do NOT write a report yet. Use your tools first."
+        )
+
+        # Phase 2 message: injected after the agent has run tools, requesting the JSON report.
+        report_request = (
+            f"Investigation complete. Now write your incident report.\n\n"
+            f"Output a JSON object as the LAST thing in your response, in ```json ... ``` fences.\n"
+            f"Fill in real values from what your tools returned — do not invent anything:\n"
+            f"```json\n"
+            f'{{\n'
+            f'  "incident_id": "{incident_id}",\n'
+            f'  "rule": "{alert.rule}",\n'
+            f'  "host": "{host}",\n'
+            f'  "verdict": "<confirmed_threat|likely_threat|false_positive|inconclusive>",\n'
+            f'  "cve_ids": [],\n'
+            f'  "summary": "<one paragraph grounded in tool output>",\n'
+            f'  "evidence": ["<exact finding from tool output>"],\n'
+            f'  "actions_taken": ["<actual remediation steps taken>"],\n'
+            f'  "recommended_next_steps": ["<follow-up>"]\n'
+            f'}}\n'
+            f"```"
+        )
+
+        ilog.info("agent.start")
+
+        # --- Phase 1: investigate (must produce tool calls) ---
+        messages = [
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=investigate_message),
+        ]
+
+        final_messages = None
+        tool_call_count = 0
+
+        async for event in self._graph.astream_events({"messages": messages}, version="v2"):
+            kind = event["event"]
+            name = event.get("name", "")
+
+            if kind == "on_tool_start":
+                tool_call_count += 1
+                raw_input = event["data"].get("input") or {}
+                input_preview = json.dumps(raw_input)[:300]
+                ilog.info("tool.call", tool=name, input=input_preview, call_n=tool_call_count)
+
+            elif kind == "on_tool_end":
+                raw_output = event["data"].get("output")
+                output_preview = str(raw_output)[:500] if raw_output is not None else ""
+                ilog.info("tool.result", tool=name, output=output_preview)
+
+            elif kind == "on_chat_model_start":
+                ilog.info("llm.thinking", model=name)
+
+            elif kind == "on_chat_model_end":
+                output = event["data"].get("output")
+                if output:
+                    content = output.content if hasattr(output, "content") else str(output)
+                    content_preview = str(content)[:200]
+                    ilog.info("llm.response", preview=content_preview)
+
+            elif kind == "on_chain_end" and name == "LangGraph":
+                output = event["data"].get("output", {})
+                final_messages = output.get("messages", [])
+                ilog.info("phase1.complete", tool_calls=tool_call_count)
+
+        if not final_messages:
+            raise RuntimeError(f"Agent produced no output for incident {incident_id}")
+
+        if tool_call_count == 0:
+            ilog.error(
+                "agent.skipped_investigation",
+                msg="Model called no tools — returning inconclusive rather than hallucinated report",
+            )
+            return IncidentReport(
+                incident_id=incident_id,
+                rule=alert.rule,
+                host=host,
+                verdict="inconclusive",
+                summary="Agent failed to perform investigation (no tool calls). Manual review required.",
+                recommended_next_steps=["Manually investigate the Falco alert on the host"],
+            )
+
+        # --- Phase 2: request the JSON report, grounded in the phase 1 tool output ---
+        ilog.info("phase2.start", msg="Requesting structured report from agent")
+        report_messages = final_messages + [HumanMessage(content=report_request)]
+
+        final_report_messages = None
+        async for event in self._graph.astream_events(
+            {"messages": report_messages}, version="v2"
+        ):
+            kind = event["event"]
+            name = event.get("name", "")
+
+            if kind == "on_tool_start":
+                # Additional tool calls during report phase are fine (e.g. polling job status)
+                raw_input = event["data"].get("input") or {}
+                ilog.info("tool.call", tool=name, input=json.dumps(raw_input)[:300])
+
+            elif kind == "on_tool_end":
+                raw_output = event["data"].get("output")
+                ilog.info("tool.result", tool=name, output=str(raw_output)[:500] if raw_output else "")
+
+            elif kind == "on_chat_model_start":
+                ilog.info("llm.thinking", model=name)
+
+            elif kind == "on_chat_model_end":
+                output = event["data"].get("output")
+                if output:
+                    content = output.content if hasattr(output, "content") else str(output)
+                    ilog.info("llm.response", preview=str(content)[:200])
+
+            elif kind == "on_chain_end" and name == "LangGraph":
+                output = event["data"].get("output", {})
+                final_report_messages = output.get("messages", [])
+                ilog.info("phase2.complete")
+
+        if not final_report_messages:
+            raise RuntimeError(f"Agent produced no report for incident {incident_id}")
+
+        final_content = final_report_messages[-1].content
+        report_json = _extract_json(final_content)
+        report = IncidentReport(**report_json)
+        report.incident_id = incident_id
+        report.host = host
+
+        ilog.info(
+            "incident.report",
+            verdict=report.verdict,
+            cves=report.cve_ids,
+            actions=len(report.actions_taken),
+        )
+        return report
+
+
+_REPORT_REQUIRED_KEYS = {"incident_id", "rule", "host", "verdict", "summary"}
+
+
+def _extract_json(text: str) -> dict[str, Any]:
+    """
+    Pull the last ```json ... ``` block from the agent's final message that
+    looks like a filled-in IncidentReport (has the required keys).
+
+    Guards against the model echoing the JSON Schema object itself (which is
+    also valid JSON but contains "properties"/"type" instead of report fields).
+    """
+    import re
+    blocks = re.findall(r"```json\s*([\s\S]+?)\s*```", text, re.IGNORECASE)
+    if not blocks:
+        raise ValueError(f"No JSON block found in agent response:\n{text[:500]}")
+
+    # Walk blocks from last to first; return first one that has the report keys
+    for raw in reversed(blocks):
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and _REPORT_REQUIRED_KEYS.issubset(obj.keys()):
+            return obj
+
+    # Last resort: try the last block and let Pydantic surface the real error
+    return json.loads(blocks[-1])
+
+
+async def build_agent() -> ThreatResponseAgent:
+    """
+    Build the LangGraph ReAct agent with MCP tools loaded at startup.
+    Call once during app lifespan; reuse the returned agent for all requests.
+    """
+    log.info("agent.build", model=AGENT_MODEL)
+
+    mcp_client = MultiServerMCPClient(
+        {
+            "linux": {
+                # linux-mcp-server uses stdio transport; we reach the RHEL VM over SSH.
+                # The client SSHs in and spawns the process, piping stdio through the tunnel.
+                "transport": "stdio",
+                "command": "ssh",
+                "args": [
+                    "-i", LINUX_MCP_SSH_KEY,
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", "BatchMode=yes",
+                    f"{LINUX_MCP_SSH_USER}@{LINUX_MCP_SSH_HOST}",
+                    LINUX_MCP_CMD,
+                ],
+            },
+            "aap": {
+                # AAP MCP server uses streamable-HTTP transport (MCP spec 2024-11-05):
+                # POST with Accept: application/json, text/event-stream
+                "url": AAP_MCP_URL,
+                "transport": "streamable_http",
+                "headers": {"Authorization": f"Bearer {AAP_TOKEN}"} if AAP_TOKEN else {},
+            },
+        }
+    )
+
+    # Load all tools from both MCP servers
+    tools = await mcp_client.get_tools()
+    log.info("agent.tools_loaded", count=len(tools), names=[t.name for t in tools])
+
+    llm = _build_llm()
+
+    graph = create_react_agent(
+        model=llm,
+        tools=tools,
+        # Checkpoint not needed for stateless webhook processing
+    )
+
+    return ThreatResponseAgent(graph, mcp_client)

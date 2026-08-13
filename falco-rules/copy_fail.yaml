@@ -1,0 +1,54 @@
+- rule: Copy Fail AF_ALG Socket Created by Unprivileged Process
+  desc: >
+    Detects creation of an AF_ALG (kernel crypto API) socket by a non-root
+    process. CVE-2026-31431 (Copy Fail) requires opening an AF_ALG socket
+    as the first step before using splice() to corrupt the page cache.
+  condition: >
+    evt.type = socket and
+    evt.arg.domain = AF_ALG and
+    not user.uid = 0
+  output: >
+    AF_ALG socket opened by unprivileged process
+    (user=%user.name uid=%user.uid pid=%proc.pid
+     comm=%proc.name parent=%proc.pname cmdline=%proc.cmdline
+     container=%container.name)
+  priority: WARNING
+  tags: [CVE-2026-31431, copy_fail, lpe, page_cache]
+
+- rule: Copy Fail Splice into AF_ALG Socket
+  desc: >
+    Detects splice() syscall targeting an AF_ALG socket from an unprivileged
+    process. Combined with AF_ALG socket creation, this is the core exploitation
+    primitive of CVE-2026-31431.
+  condition: >
+    evt.type = splice and
+    not user.uid = 0 and
+    fd.type = socket and
+    fd.sock.family = AF_ALG
+  output: >
+    splice() into AF_ALG socket by unprivileged process — possible Copy Fail exploit
+    (user=%user.name uid=%user.uid pid=%proc.pid
+     comm=%proc.name parent=%proc.pname cmdline=%proc.cmdline
+     container=%container.name)
+  priority: ERROR
+  tags: [CVE-2026-31431, copy_fail, lpe, page_cache]
+
+- rule: Setuid Binary Spawns Unexpected Root Shell
+  desc: >
+    Detects a setuid binary (e.g. /usr/bin/su) spawning a shell as root when
+    invoked by a non-root user. This is the post-exploitation indicator for
+    both Copy Fail (CVE-2026-31431) and Fragnesia (CVE-2026-46300) — the
+    corrupted in-memory setuid binary executes attacker-controlled code.
+  condition: >
+    evt.type = execve and
+    proc.pname in (su, sudo, newgrp, passwd, mount, umount) and
+    user.uid = 0 and
+    proc.vpid != proc.pid and
+    spawned_process
+  output: >
+    Setuid binary spawned root shell — possible LPE via page cache corruption
+    (user=%user.name uid=%user.uid pid=%proc.pid
+     comm=%proc.name parent=%proc.pname cmdline=%proc.cmdline
+     pcmdline=%proc.pcmdline container=%container.name)
+  priority: CRITICAL
+  tags: [CVE-2026-31431, CVE-2026-46300, copy_fail, fragnesia, lpe, page_cache]
