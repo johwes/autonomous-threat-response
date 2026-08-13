@@ -41,7 +41,7 @@
     corrupted in-memory setuid binary executes attacker-controlled code.
   condition: >
     spawned_process and
-    proc.pname in (su, sudo, newgrp, passwd, mount, umount) and
+    proc.pname in (su, newgrp, passwd, mount, umount) and
     user.uid = 0 and
     proc.name in (bash, sh, dash, zsh, ksh, ksh93, tcsh, csh, fish, rbash, rzsh)
   output: >
