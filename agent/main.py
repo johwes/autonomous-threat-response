@@ -101,7 +101,18 @@ async def healthz():
 
 
 @app.post("/webhook", response_model=IncidentReport)
-async def webhook(alert: FalcoAlert, request: Request):
+async def webhook(request: Request):
+    # Parse body manually — Falco's HTTP output does not always send
+    # Content-Type: application/json, which causes FastAPI to reject the
+    # request with 422 before reaching the handler.
+    try:
+        body = await request.json()
+        alert = FalcoAlert.model_validate(body)
+    except Exception as exc:
+        raw = await request.body()
+        log.error("webhook.parse_error", error=str(exc), raw=raw[:500])
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+
     incident_id = str(uuid.uuid4())[:8]
     log.info(
         "webhook.received",
