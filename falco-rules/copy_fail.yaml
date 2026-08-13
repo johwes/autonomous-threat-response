@@ -35,21 +35,23 @@
   priority: ERROR
   tags: [CVE-2026-31431, copy_fail, lpe, page_cache]
 
-- rule: Setuid Binary Spawns Unexpected Root Shell
+- rule: Root Shell Spawned Directly by User Shell
   desc: >
-    Detects a non-shell setuid binary (su, passwd, newgrp, mount, umount)
-    spawning a shell as root on the host. This is the post-exploitation
-    indicator for both Copy Fail (CVE-2026-31431) and Fragnesia
-    (CVE-2026-46300) — the corrupted in-memory setuid binary executes
-    attacker-controlled code.
+    Detects a root shell (uid=0) whose direct parent is a user-level
+    interactive shell. In legitimate su/sudo usage, the root shell's
+    parent is su or sudo. In Copy Fail (CVE-2026-31431) and Fragnesia
+    (CVE-2026-46300), the corrupted setuid binary calls execve() to
+    replace itself with a shell — so the root shell's parent is the
+    user's original bash/sh, not su. This parent-is-user-shell pattern
+    is the reliable post-exploitation fingerprint.
   condition: >
     spawned_process and
     not container and
-    proc.pname in (su, newgrp, passwd, mount, umount) and
     user.uid = 0 and
-    proc.name in (bash, sh, dash, zsh, ksh, ksh93, tcsh, csh, fish, rbash, rzsh)
+    proc.name in (bash, sh, dash, zsh, ksh, ksh93, tcsh, csh, fish, rbash, rzsh) and
+    proc.pname in (bash, sh, dash, zsh, ksh, ksh93, tcsh, csh, fish, rbash, rzsh)
   output: >
-    Setuid binary spawned root shell — possible LPE via page cache corruption
+    Root shell spawned directly by user shell — possible LPE via page cache corruption
     (user=%user.name uid=%user.uid pid=%proc.pid
      comm=%proc.name parent=%proc.pname cmdline=%proc.cmdline
      pcmdline=%proc.pcmdline container=%container.name)
