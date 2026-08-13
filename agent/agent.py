@@ -172,11 +172,16 @@ class ThreatResponseAgent:
         host = alert.output_fields.get("container.name") or alert.hostname or "unknown"
         ilog = log.bind(incident_id=incident_id, host=host, rule=alert.rule)
 
-        # Phase 1 message: alert details ONLY — no mention of output format.
-        # Keeping the report template out of this message prevents the model from
-        # pattern-matching "fill in template → done" before calling any tools.
-        investigate_message = (
-            f"Falco alert received. Investigate now using your tools.\n\n"
+        # Single-phase: send the full alert + report template in one message.
+        # The ReAct graph runs tool calls then the model writes the JSON report
+        # as its final (non-tool) response. We extract JSON from that last message.
+        #
+        # A two-phase approach (separate investigation + report calls) causes the
+        # model to keep invoking tools during the "report" phase because it hasn't
+        # finished investigating. Keeping everything in a single graph run lets the
+        # model decide when it's done, which is exactly what ReAct is designed for.
+        user_message = (
+            f"Falco alert received. Investigate and report.\n\n"
             f"**Alert Rule:** {alert.rule}\n"
             f"**Priority:** {alert.priority}\n"
             f"**Host:** {host}\n"
@@ -185,18 +190,10 @@ class ThreatResponseAgent:
             f"**Raw output:** {alert.output}\n"
             f"**Output fields:**\n```json\n{json.dumps(alert.output_fields, indent=2)}\n```\n\n"
             f"Incident ID: {incident_id}\n\n"
-            f"Follow the MANDATORY WORKFLOW from your instructions:\n"
-            f"1. Call get_process_info, get_audit_logs, get_journal_logs, get_network_connections\n"
-            f"2. Determine the CVE pattern from the evidence\n"
-            f"3. Remediate if confirmed (job_templates_list → job_templates_launch_create → jobs_retrieve)\n\n"
-            f"Do NOT write a report yet. Use your tools first."
-        )
-
-        # Phase 2 message: injected after the agent has run tools, requesting the JSON report.
-        report_request = (
-            f"Investigation complete. Now write your incident report.\n\n"
-            f"Output a JSON object as the LAST thing in your response, in ```json ... ``` fences.\n"
-            f"Fill in real values from what your tools returned — do not invent anything:\n"
+            f"Follow the MANDATORY WORKFLOW:\n"
+            f"1. Call get_process_info, get_journal_logs, get_network_connections\n"
+            f"2. If threat confirmed, remediate: job_templates_list → job_templates_launch_create → jobs_retrieve\n"
+            f"3. AFTER all tools, output your incident report as the LAST thing in your response:\n\n"
             f"```json\n"
             f'{{\n'
             f'  "incident_id": "{incident_id}",\n'
@@ -209,19 +206,20 @@ class ThreatResponseAgent:
             f'  "actions_taken": ["<actual remediation steps taken>"],\n'
             f'  "recommended_next_steps": ["<follow-up>"]\n'
             f'}}\n'
-            f"```"
+            f"```\n\n"
+            f"Do NOT output the JSON template until you have finished all tool calls."
         )
+
+        messages = [
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=user_message),
+        ]
 
         ilog.info("agent.start")
 
-        # --- Phase 1: investigate (must produce tool calls) ---
-        messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=investigate_message),
-        ]
-
         final_messages = None
         tool_call_count = 0
+        last_ai_content = ""
 
         async for event in self._graph.astream_events({"messages": messages}, version="v2"):
             kind = event["event"]
@@ -245,110 +243,74 @@ class ThreatResponseAgent:
                 output = event["data"].get("output")
                 if output:
                     content = output.content if hasattr(output, "content") else str(output)
-                    content_preview = str(content)[:200]
-                    ilog.info("llm.response", preview=content_preview)
+                    content_str = str(content)
+                    # Track the last non-empty AI response — this will be the report
+                    if content_str.strip():
+                        last_ai_content = content_str
+                    ilog.info("llm.response", preview=content_str[:300])
 
             elif kind == "on_chain_end" and name == "LangGraph":
                 output = event["data"].get("output", {})
                 final_messages = output.get("messages", [])
-                ilog.info("phase1.complete", tool_calls=tool_call_count)
+                ilog.info("graph.complete", tool_calls=tool_call_count)
 
         if not final_messages:
             raise RuntimeError(f"Agent produced no output for incident {incident_id}")
 
         if tool_call_count == 0:
-            ilog.error(
-                "agent.skipped_investigation",
-                msg="Model called no tools — returning inconclusive rather than hallucinated report",
-            )
+            ilog.error("agent.no_tools", msg="Model called no tools")
             return IncidentReport(
-                incident_id=incident_id,
-                rule=alert.rule,
-                host=host,
+                incident_id=incident_id, rule=alert.rule, host=host,
                 verdict="inconclusive",
                 summary="Agent failed to perform investigation (no tool calls). Manual review required.",
                 recommended_next_steps=["Manually investigate the Falco alert on the host"],
             )
 
-        # --- Phase 2: call the LLM directly with a clean summary of tool findings ---
-        # We do NOT pass final_messages back to the LLM. The graph history contains
-        # model-specific special tokens (<|channel|>commentary<|message|>) that confuse
-        # the model when replayed as context and cause it to return empty responses.
-        # Instead, extract the ToolMessages from the history and build a clean summary.
-        ilog.info("phase2.start", msg="Requesting structured report from agent")
-
-        tool_findings = []
-        for msg in final_messages:
-            # ToolMessages have a 'name' attribute and represent tool call results
+        # Extract final AI message text from graph output
+        # Walk messages in reverse to find the last AIMessage with text content
+        final_text = ""
+        for msg in reversed(final_messages):
             msg_type = type(msg).__name__
-            if msg_type == "ToolMessage" or (hasattr(msg, "name") and hasattr(msg, "tool_call_id")):
-                tool_name = getattr(msg, "name", "unknown")
+            if msg_type in ("AIMessage", "AIMessageChunk") or (
+                hasattr(msg, "content") and not hasattr(msg, "tool_call_id")
+                and not hasattr(msg, "role")
+            ):
                 content = msg.content
-                # content may be a string or a list of content blocks
                 if isinstance(content, list):
-                    text_parts = [
+                    content = "\n".join(
                         c.get("text", "") if isinstance(c, dict) else str(c)
                         for c in content
-                    ]
-                    content = "\n".join(text_parts)
-                tool_findings.append(f"[{tool_name}]:\n{str(content)[:2000]}")
+                    )
+                content = str(content)
+                # Strip model-specific channel tokens (gpt-oss-120b emits these)
+                if "<|message|>" in content:
+                    after = content.split("<|message|>", 1)[-1].strip()
+                    content = after if after else content.split("<|channel|>")[0].strip()
+                if content.strip():
+                    final_text = content
+                    break
 
-        findings_text = "\n\n".join(tool_findings) if tool_findings else "No tool output captured."
+        # Fallback to the streaming-captured last AI response if graph output failed
+        if not final_text and last_ai_content:
+            ilog.warning("agent.fallback_to_streamed", msg="Using streamed content since graph output was empty")
+            final_text = last_ai_content
 
-        phase2_messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=(
-                f"Investigation complete for incident {incident_id}.\n\n"
-                f"TOOL FINDINGS FROM INVESTIGATION:\n{findings_text}\n\n"
-                f"{report_request}"
-            )),
-        ]
+        ilog.info("agent.final_response", length=len(final_text), preview=final_text[:500])
 
-        ilog.info("llm.thinking", model="phase2")
-        phase2_response = await self._llm.ainvoke(phase2_messages)
-        raw_content = phase2_response.content if hasattr(phase2_response, "content") else str(phase2_response)
-        # Some models return content as a list of blocks; extract text
-        if isinstance(raw_content, list):
-            raw_content = "\n".join(
-                c.get("text", "") if isinstance(c, dict) else str(c)
-                for c in raw_content
-            )
-        # Strip model-specific channel tokens (e.g. gpt-oss-120b uses <|channel|>...<|message|>)
-        if "<|message|>" in raw_content:
-            after_token = raw_content.split("<|message|>", 1)[-1].strip()
-            # If nothing after the token, try the part before it
-            final_content = after_token if after_token else raw_content.split("<|channel|>")[0].strip()
-        else:
-            final_content = raw_content
-        # Log full phase 2 response for debugging (first 1000 chars)
-        ilog.info("phase2.response_raw", length=len(raw_content), content=raw_content[:1000])
-        ilog.info("phase2.complete")
-
-        if not final_content or not final_content.strip():
-            ilog.error(
-                "agent.phase2_empty",
-                msg="Phase 2 LLM returned empty response — returning inconclusive",
-            )
+        if not final_text.strip():
             return IncidentReport(
-                incident_id=incident_id,
-                rule=alert.rule,
-                host=host,
+                incident_id=incident_id, rule=alert.rule, host=host,
                 verdict="inconclusive",
-                summary="Agent investigated but failed to produce a structured report. Manual review required.",
+                summary="Agent investigated but produced no report text.",
                 recommended_next_steps=["Manually review Falco alert and tool output"],
             )
 
-        report_json = _extract_json(final_content)
+        report_json = _extract_json(final_text)
         report = IncidentReport(**report_json)
         report.incident_id = incident_id
         report.host = host
 
-        ilog.info(
-            "incident.report",
-            verdict=report.verdict,
-            cves=report.cve_ids,
-            actions=len(report.actions_taken),
-        )
+        ilog.info("incident.report", verdict=report.verdict, cves=report.cve_ids, actions=len(report.actions_taken))
         return report
 
 
