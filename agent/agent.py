@@ -362,9 +362,11 @@ def _strip_host_param(tool):
     }
     NewSchema = create_model(schema.__name__ + "_nohost", **new_fields)
 
-    # Delegate to the original MCP tool; since host is Optional there, omitting it
-    # makes the server fall back to local execution mode (which is what we want).
+    # Delegate to the original MCP tool without the host param.
+    # We filter host here too (not just from the schema) because gpt-oss-120b
+    # hallucinates it from training memory even when it's absent from the schema.
     async def _arun(**kwargs):
+        kwargs.pop("host", None)
         return await tool.arun(kwargs)
 
     return StructuredTool.from_function(
