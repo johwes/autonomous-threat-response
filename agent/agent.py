@@ -304,32 +304,43 @@ class ThreatResponseAgent:
             ilog.warning("agent.graph_report_failed", error=str(e), msg="Falling back to direct LLM report call")
 
         # --- Fallback: direct LLM call with tool findings summary ---
-        # The model completed its tool calls but didn't write the JSON report
-        # (it emitted another tool call JSON as plain text, or an empty response).
-        # Build a clean prompt with just the tool findings and ask for the report.
+        # The model didn't write the JSON report as its final response
+        # (it emitted tool call JSON as plain text, or the response was empty).
+        # Use a minimal system prompt (no tool references) so the model doesn't
+        # try to make more tool calls instead of writing the report.
         findings_text = "\n\n".join(tool_findings) if tool_findings else "No tool output captured."
 
+        REPORT_ONLY_PROMPT = (
+            "You are a security analyst writing an incident report. "
+            "You have already investigated the system using tools. "
+            "Your ONLY job now is to output a JSON incident report. "
+            "Do not make any tool calls. Do not write anything except the JSON block."
+        )
+
         report_request = (
-            f"Investigation complete for incident {incident_id}.\n\n"
-            f"TOOL FINDINGS:\n{findings_text}\n\n"
-            f"Now output ONLY the JSON incident report (no explanatory text, just the JSON block):\n\n"
+            f"Write the incident report for incident {incident_id}.\n\n"
+            f"TOOL FINDINGS FROM INVESTIGATION:\n{findings_text}\n\n"
+            f"Output ONLY this JSON (nothing else, no preamble, no explanation):\n\n"
             f"```json\n"
             f'{{\n'
             f'  "incident_id": "{incident_id}",\n'
             f'  "rule": "{alert.rule}",\n'
             f'  "host": "{host}",\n'
-            f'  "verdict": "<confirmed_threat|likely_threat|false_positive|inconclusive>",\n'
+            f'  "verdict": "false_positive",\n'
             f'  "cve_ids": [],\n'
-            f'  "summary": "<one paragraph grounded in tool output>",\n'
-            f'  "evidence": ["<exact finding from tool output>"],\n'
-            f'  "actions_taken": ["<actual remediation steps taken>"],\n'
-            f'  "recommended_next_steps": ["<follow-up>"]\n'
+            f'  "summary": "Replace with one paragraph grounded in the tool findings above.",\n'
+            f'  "evidence": ["Replace with exact quotes from tool output"],\n'
+            f'  "actions_taken": [],\n'
+            f'  "recommended_next_steps": ["Manual review recommended"]\n'
             f'}}\n'
-            f"```"
+            f"```\n\n"
+            f"Set verdict to confirmed_threat/likely_threat/false_positive/inconclusive based on the findings. "
+            f"If no suspicious activity found, use false_positive. "
+            f"Fill in real evidence from the tool findings above."
         )
 
         phase2_messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
+            SystemMessage(content=REPORT_ONLY_PROMPT),
             HumanMessage(content=report_request),
         ]
 
@@ -344,19 +355,31 @@ class ThreatResponseAgent:
             raw = after if after else raw.split("<|channel|>")[0].strip()
         ilog.info("phase2.response", length=len(raw), preview=raw[:500])
 
-        if not raw.strip():
-            return IncidentReport(
-                incident_id=incident_id, rule=alert.rule, host=host,
-                verdict="inconclusive",
-                summary="Agent investigated but produced no structured report.",
-                recommended_next_steps=["Manually review Falco alert and tool output"],
-            )
+        # Try to parse LLM report; if it fails, build report programmatically
+        try:
+            report_json = _extract_json(raw)
+            report = IncidentReport(**report_json)
+            report.incident_id = incident_id
+            report.host = host
+            ilog.info("incident.report", verdict=report.verdict, cves=report.cve_ids, actions=len(report.actions_taken))
+            return report
+        except Exception as e:
+            ilog.warning("phase2.parse_failed", error=str(e), msg="Building report from findings")
 
-        report_json = _extract_json(raw)
-        report = IncidentReport(**report_json)
-        report.incident_id = incident_id
-        report.host = host
-        ilog.info("incident.report", verdict=report.verdict, cves=report.cve_ids, actions=len(report.actions_taken))
+        # Last resort: build report programmatically from tool findings
+        has_suspicious = any(
+            kw in f.lower() for f in tool_findings
+            for kw in ("algif", "splice", "esp4", "esp6", "unshare", "clone_newuser", "root shell")
+        )
+        verdict = "likely_threat" if has_suspicious else "inconclusive"
+        evidence = [f[:200] for f in tool_findings[:5]] if tool_findings else ["No tool output"]
+        report = IncidentReport(
+            incident_id=incident_id, rule=alert.rule, host=host, verdict=verdict,
+            summary=f"Automated investigation completed {tool_call_count} tool calls. Manual review required.",
+            evidence=evidence,
+            recommended_next_steps=["Manually review Falco alert and tool output"],
+        )
+        ilog.info("incident.report", verdict=report.verdict, source="programmatic")
         return report
 
 
