@@ -177,11 +177,71 @@ def _build_llm():
 # Agent construction (called once at startup)
 # ---------------------------------------------------------------------------
 
+AAP_TARGET_HOST = "rhel9-brown-loon-92-ssh"
+AAP_TEMPLATE_IDS = {
+    "drop_page_cache": 10,
+    "kill_session": 8,
+    "lock_user": 11,
+}
+
+
 class ThreatResponseAgent:
-    def __init__(self, graph, mcp_client: MultiServerMCPClient, llm):
+    def __init__(self, graph, mcp_client: MultiServerMCPClient, llm, aap_tools: dict):
         self._graph = graph
         self._mcp_client = mcp_client
         self._llm = llm
+        self._aap_tools = aap_tools  # name -> tool object
+
+    async def _run_aap_remediation(self, ilog, root_pid) -> list[str]:
+        """Programmatically launch AAP playbooks without going through the LLM.
+
+        Used in the fallback path when the graph exits early but we've already
+        confirmed the Copy Fail fingerprint from process findings.
+        """
+        launch_tool = self._aap_tools.get("job_templates_launch_create")
+        retrieve_tool = self._aap_tools.get("jobs_retrieve")
+        if not launch_tool or not retrieve_tool:
+            ilog.warning("aap.tools_missing", msg="AAP tools not available for programmatic remediation")
+            return []
+
+        actions = []
+        playbooks = [
+            ("drop_page_cache", AAP_TEMPLATE_IDS["drop_page_cache"],
+             json.dumps({"target_host": AAP_TARGET_HOST})),
+            ("kill_session", AAP_TEMPLATE_IDS["kill_session"],
+             json.dumps({"target_pid": str(root_pid), "target_host": AAP_TARGET_HOST})),
+            ("lock_user", AAP_TEMPLATE_IDS["lock_user"],
+             json.dumps({"compromised_user": "cloud-user", "target_host": AAP_TARGET_HOST})),
+        ]
+
+        for name, template_id, extra_vars in playbooks:
+            try:
+                ilog.info("aap.launch", playbook=name, template_id=template_id)
+                launch_result = await launch_tool.ainvoke(
+                    {"id": str(template_id), "extra_vars": extra_vars}
+                )
+                result_text = str(launch_result)
+                # Extract job ID from response
+                job_id = None
+                try:
+                    import re
+                    m = re.search(r'"id":\s*(\d+)', result_text)
+                    if m:
+                        job_id = m.group(1)
+                except Exception:
+                    pass
+
+                if job_id:
+                    ilog.info("aap.launched", playbook=name, job_id=job_id)
+                    retrieve_result = await retrieve_tool.ainvoke({"id": job_id})
+                    ilog.info("aap.retrieved", playbook=name, job_id=job_id, result=str(retrieve_result)[:200])
+                    actions.append(f"{name} (job_id={job_id})")
+                else:
+                    ilog.warning("aap.no_job_id", playbook=name, result=result_text[:300])
+            except Exception as exc:
+                ilog.error("aap.launch_failed", playbook=name, error=str(exc))
+
+        return actions
 
     async def ainvoke(self, alert, incident_id: str) -> IncidentReport:
         host = alert.output_fields.get("container.name") or alert.hostname or "unknown"
@@ -307,7 +367,8 @@ class ThreatResponseAgent:
 
         ilog.info("agent.final_text", length=len(final_text), preview=final_text[:300])
 
-        # Try to parse the report from the graph's final text
+        # Try to parse the report from the graph's final text — if it succeeded
+        # with remediation already done, use it directly and we're done.
         try:
             report_json = _extract_json(final_text)
             report = IncidentReport(**report_json)
@@ -319,18 +380,21 @@ class ThreatResponseAgent:
             ilog.warning("agent.graph_report_failed", error=str(e), msg="Falling back to direct LLM report call")
 
         # --- Fallback: direct LLM call with tool findings summary ---
-        # The model didn't write the JSON report as its final response
-        # (it emitted tool call JSON as plain text, or the response was empty).
-        # Use a minimal system prompt (no tool references) so the model doesn't
-        # try to make more tool calls instead of writing the report.
+        # The model didn't write the JSON report as its final response.
+        # Detect the Copy Fail fingerprint from process findings and trigger
+        # AAP remediation programmatically — no LLM needed for that part.
         findings_text = "\n\n".join(tool_findings) if tool_findings else "No tool output captured."
 
-        # Detect Copy Fail fingerprint directly from process findings:
-        # uid=0 shell whose parent is a non-root user shell.
-        # This is the execve() replacement pattern — reliable even without journal logs.
+        # Detect Copy Fail fingerprint directly from process findings and the rule name.
         copy_fail_confirmed = _detect_copy_fail_pattern(tool_findings, alert.rule)
+
+        # Extract root shell PID from the Falco alert output_fields
+        root_pid = alert.output_fields.get("proc.pid") or alert.output_fields.get("pid")
+
+        actions_taken = []
         if copy_fail_confirmed:
-            ilog.info("phase2.copy_fail_detected", msg="Process tree matches Copy Fail fingerprint — triggering remediation")
+            ilog.info("phase2.copy_fail_detected", msg="Process tree matches Copy Fail — triggering AAP remediation")
+            actions_taken = await self._run_aap_remediation(ilog, root_pid)
 
         REPORT_ONLY_PROMPT = (
             "You are a security analyst writing an incident report. "
@@ -347,10 +411,7 @@ class ThreatResponseAgent:
             "Use confirmed_threat/likely_threat/false_positive/inconclusive based on the findings."
         )
         cve_hint = '["CVE-2026-31431"]' if copy_fail_confirmed else "[]"
-        actions_hint = (
-            '["Triggered drop_page_cache playbook via AAP", "Triggered kill_session playbook via AAP"]'
-            if copy_fail_confirmed else "[]"
-        )
+        actions_hint = json.dumps(actions_taken) if actions_taken else "[]"
 
         report_request = (
             f"Write the incident report for incident {incident_id}.\n\n"
@@ -412,8 +473,10 @@ class ThreatResponseAgent:
         evidence = [f[:200] for f in tool_findings[:5]] if tool_findings else ["No tool output"]
         report = IncidentReport(
             incident_id=incident_id, rule=alert.rule, host=host, verdict=verdict,
+            cve_ids=["CVE-2026-31431"] if copy_fail_confirmed else [],
             summary=f"Automated investigation completed {tool_call_count} tool calls. Manual review required.",
             evidence=evidence,
+            actions_taken=actions_taken,
             recommended_next_steps=["Manually review Falco alert and tool output"],
         )
         ilog.info("incident.report", verdict=report.verdict, source="programmatic")
@@ -627,4 +690,7 @@ async def build_agent() -> ThreatResponseAgent:
         # Checkpoint not needed for stateless webhook processing
     )
 
-    return ThreatResponseAgent(graph, mcp_client, llm)
+    # Keep a direct reference to AAP tools for programmatic fallback remediation
+    aap_tools = {t.name: t for t in tools if t.name in AAP_TOOLS}
+
+    return ThreatResponseAgent(graph, mcp_client, llm, aap_tools)
