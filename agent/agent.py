@@ -21,7 +21,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt import create_react_agent
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 
 log = structlog.get_logger()
 
@@ -337,6 +337,44 @@ def _extract_json(text: str) -> dict[str, Any]:
     return json.loads(blocks[-1])
 
 
+def _strip_host_param(tool):
+    """Return a wrapper tool with 'host' removed from the schema the model sees.
+
+    linux-mcp-server's 'host' parameter triggers a second SSH hop from the VM
+    back to a potentially stale IP. Since we already SSH into the VM to spawn
+    the server, all tools run locally — removing the param from the schema
+    prevents the model from ever generating it. The underlying tool accepts
+    calls without 'host' fine (it defaults to local execution mode).
+    """
+    from langchain_core.tools import StructuredTool
+
+    schema = tool.args_schema
+    if schema is None:
+        return tool
+    fields = getattr(schema, "model_fields", {})
+    if "host" not in fields:
+        return tool
+
+    new_fields = {
+        name: (info.annotation, info)
+        for name, info in fields.items()
+        if name != "host"
+    }
+    NewSchema = create_model(schema.__name__ + "_nohost", **new_fields)
+
+    # Delegate to the original MCP tool; since host is Optional there, omitting it
+    # makes the server fall back to local execution mode (which is what we want).
+    async def _arun(**kwargs):
+        return await tool.arun(kwargs)
+
+    return StructuredTool.from_function(
+        coroutine=_arun,
+        name=tool.name,
+        description=tool.description,
+        args_schema=NewSchema,
+    )
+
+
 async def build_agent() -> ThreatResponseAgent:
     """
     Build the LangGraph ReAct agent with MCP tools loaded at startup.
@@ -391,6 +429,13 @@ async def build_agent() -> ThreatResponseAgent:
     all_tools = await mcp_client.get_tools()
     tools = [t for t in all_tools if t.name in ALLOWED_TOOLS]
     skipped = [t.name for t in all_tools if t.name not in ALLOWED_TOOLS]
+
+    # Strip the "host" parameter from all linux tools.
+    # linux-mcp-server's remote-execution flag is controlled by the server itself;
+    # exposing "host" to the model causes it to attempt a second SSH hop from the VM
+    # back to itself using a potentially stale IP, which always fails.
+    tools = [_strip_host_param(t) if t.name in LINUX_TOOLS else t for t in tools]
+
     log.info(
         "agent.tools_loaded",
         count=len(tools),
