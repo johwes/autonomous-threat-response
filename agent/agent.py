@@ -108,19 +108,22 @@ If verdict is confirmed_threat or likely_threat, you MUST run remediation using 
 Do NOT write actions_taken in the report unless you actually called the AAP tools and saw results.
 Fabricating remediation actions is a critical failure.
 
-Remediation sequence for Copy Fail:
-1. Call job_templates_list — find templates named "drop_page_cache", "kill_session", "lock_user"
-2. For each playbook in order:
-   a. Call job_templates_launch_create with the template ID and extra_vars (JSON string)
-   b. Call jobs_retrieve with the returned job ID to confirm completion
-3. Only include a playbook in actions_taken if you saw its job_id in tool output
+Job template IDs are fixed — do NOT call job_templates_list, use these IDs directly:
+- drop_page_cache : id=10
+- kill_session    : id=8
+- lock_user       : id=11
 
-extra_vars for each playbook (pass as a JSON string):
-IMPORTANT: always use "rhel9-brown-loon-92-ssh" as target_host — this is the Kubernetes Service
-DNS name for the RHEL VM, reachable from AAP within the same namespace.
-- "drop_page_cache": {{"target_host": "rhel9-brown-loon-92-ssh"}}
-- "kill_session":    {{"target_pid": <root shell PID>, "target_host": "rhel9-brown-loon-92-ssh"}}
-- "lock_user":       {{"compromised_user": "<username of parent shell owner>", "target_host": "rhel9-brown-loon-92-ssh"}}
+For each playbook:
+1. Call job_templates_launch_create with the template id and extra_vars
+2. Call jobs_retrieve with the job ID returned from the launch to confirm completion
+3. Only add to actions_taken if you saw a job ID returned from launch
+
+extra_vars (always use "rhel9-brown-loon-92-ssh" as target_host — the K8s Service DNS name):
+- drop_page_cache : {{"target_host": "rhel9-brown-loon-92-ssh"}}
+- kill_session    : {{"target_pid": <root shell PID from get_process_info>, "target_host": "rhel9-brown-loon-92-ssh"}}
+- lock_user       : {{"compromised_user": "<non-root username from parent process>", "target_host": "rhel9-brown-loon-92-ssh"}}
+
+Run drop_page_cache first, then kill_session, then lock_user.
 
 ### STEP 4 — REPORT
 Output ONLY the JSON report. Evidence must quote actual tool output, not assumptions.
