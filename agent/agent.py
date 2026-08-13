@@ -344,70 +344,41 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 
 def _strip_host_param(tool):
-    """Strip 'host' from linux MCP tools before every call.
+    """Wrap a linux MCP tool to strip 'host' before every call.
 
     linux-mcp-server's 'host' triggers a second SSH hop from the VM back to
     itself (at a stale pod IP). Since we already SSH into the VM to spawn the
     server, all tools must run locally.
 
-    Two-layer defence:
-    1. Replace args_schema with a schema that omits 'host' and silently drops
-       any extra fields (extra='ignore'). LangChain validates tool inputs
-       through args_schema before calling _run/_arun, so host is stripped there.
-    2. Monkey-patch _arun so even if host somehow slips through validation it
-       is popped before reaching linux-mcp-server.
+    We wrap at the ainvoke/invoke level (not _arun/_run) so we intercept the
+    call regardless of which code path LangChain/LangGraph takes internally.
+    The wrapper pops 'host' from the input dict and also coerces ISO 8601
+    'since' timestamps that journalctl cannot parse.
     """
-    from pydantic import ConfigDict
-
     tool_name = tool.name  # capture for closure
+    original_ainvoke = tool.ainvoke
+    original_invoke = tool.invoke
 
-    # --- 1. Replace args_schema ---
-    schema = tool.args_schema
-    # Pydantic v2 uses model_fields; v1 uses __fields__
-    original_fields = (
-        getattr(schema, "model_fields", None)
-        or getattr(schema, "__fields__", None)
-        or {}
-    )
-    if original_fields:
-        # Build annotation/FieldInfo pairs without 'host'
-        clean_fields = {}
-        for k, v in original_fields.items():
-            if k == "host":
-                continue
-            # Pydantic v2 FieldInfo has .annotation; v1 ModelField has .outer_type_
-            annotation = getattr(v, "annotation", None) or getattr(v, "outer_type_", None) or str
-            clean_fields[k] = (annotation, v)
+    def _clean_input(input_data):
+        """Pop host and coerce since; works on dict and string inputs."""
+        if isinstance(input_data, dict):
+            cleaned = {k: v for k, v in input_data.items() if k != "host"}
+            if "since" in cleaned and isinstance(cleaned.get("since"), str) and "T" in cleaned["since"]:
+                cleaned["since"] = cleaned["since"].replace("T", " ").rstrip("Z")
+            had_host = "host" in input_data
+            log.info("strip_host.call", tool=tool_name, had_host=had_host, keys=list(cleaned.keys()))
+            return cleaned
+        return input_data  # strings/other types passed through unchanged
 
-        # Use __base__ (documented create_model param) to embed the ConfigDict
-        class _IgnoreExtraBase(BaseModel):
-            model_config = ConfigDict(extra="ignore")
+    async def _wrapped_ainvoke(input, config=None, **kwargs):
+        return await original_ainvoke(_clean_input(input), config=config, **kwargs)
 
-        CleanSchema = create_model(
-            f"{tool_name}_nohost",
-            __base__=_IgnoreExtraBase,
-            **clean_fields,
-        )
-        # args_schema is a typed Pydantic field on BaseTool; direct assignment works
-        tool.args_schema = CleanSchema
-        log.info("strip_host.schema_replaced", tool=tool_name, remaining_fields=list(clean_fields.keys()))
-    else:
-        log.warning("strip_host.no_schema_fields", tool=tool_name, schema_type=type(schema).__name__)
+    def _wrapped_invoke(input, config=None, **kwargs):
+        return original_invoke(_clean_input(input), config=config, **kwargs)
 
-    # --- 2. Monkey-patch _arun ---
-    # _arun is a class method (non-data descriptor), so instance __dict__ takes precedence.
-    # object.__setattr__ bypasses Pydantic's __setattr__ to write directly to __dict__.
-    original_arun = tool._arun  # capture bound method before replacement
-
-    async def _patched_arun(**kwargs):
-        had_host = "host" in kwargs
-        kwargs.pop("host", None)
-        if "since" in kwargs and isinstance(kwargs.get("since"), str) and "T" in kwargs["since"]:
-            kwargs["since"] = kwargs["since"].replace("T", " ").rstrip("Z")
-        log.info("strip_host.call", tool=tool_name, had_host=had_host, kwargs_keys=list(kwargs.keys()))
-        return await original_arun(**kwargs)
-
-    object.__setattr__(tool, "_arun", _patched_arun)
+    # object.__setattr__ bypasses Pydantic's __setattr__ guard on model instances
+    object.__setattr__(tool, "ainvoke", _wrapped_ainvoke)
+    object.__setattr__(tool, "invoke", _wrapped_invoke)
     log.info("strip_host.patched", tool=tool_name)
     return tool
 
