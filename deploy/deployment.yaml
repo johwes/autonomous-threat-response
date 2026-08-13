@@ -18,6 +18,7 @@ spec:
       containers:
         - name: agent
           image: quay.io/YOURORG/threat-response-agent:latest
+          imagePullPolicy: Always
           ports:
             - containerPort: 8080
               protocol: TCP
