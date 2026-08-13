@@ -382,47 +382,72 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 
 def _strip_host_param(tool):
-    """Wrap a linux tool so 'host' is always stripped before calling it.
+    """Strip 'host' from linux MCP tools before every call.
 
     linux-mcp-server's 'host' triggers a second SSH hop from the VM back to
-    itself (at a potentially stale IP). Since we already SSH into the VM to
-    spawn the server, all tools must run locally.
+    itself (at a stale pod IP). Since we already SSH into the VM to spawn the
+    server, all tools must run locally.
 
-    Previous attempts used Pydantic schema inspection to remove the field, but
-    that failed silently when MCP tools use Pydantic v1 schemas (model_fields
-    is absent → early return → original tool used unchanged). This version
-    ALWAYS wraps without any schema inspection.
+    Two-layer defence:
+    1. Replace args_schema with a schema that omits 'host' and silently drops
+       any extra fields (extra='ignore'). LangChain validates tool inputs
+       through args_schema before calling _run/_arun, so host is stripped there.
+    2. Monkey-patch _arun so even if host somehow slips through validation it
+       is popped before reaching linux-mcp-server.
     """
-    from langchain_core.tools import StructuredTool
+    from pydantic import ConfigDict
 
-    # Build a schema identical to the original but with 'host' removed, so
-    # the model never sees the parameter and can't generate it.
-    original_schema = tool.args_schema
-    original_fields = getattr(original_schema, "model_fields", {}) if original_schema else {}
-    if original_fields:
-        clean_fields = {k: (v.annotation, v) for k, v in original_fields.items() if k != "host"}
-        CleanSchema = create_model(f"{tool.name}_nohost", **clean_fields)
-    else:
-        CleanSchema = original_schema
+    tool_name = tool.name  # capture for closure
 
-    async def _arun(**kwargs):
-        kwargs.pop("host", None)
-        # Coerce ISO 8601 'since' to "YYYY-MM-DD HH:MM:SS": journalctl rejects
-        # timestamps with a T separator or trailing Z.
-        if "since" in kwargs and isinstance(kwargs["since"], str):
-            s = kwargs["since"]
-            if "T" in s:
-                kwargs["since"] = s.replace("T", " ").rstrip("Z")
-        # Call the underlying MCP tool's run method directly with cleaned kwargs.
-        # tool.arun(dict) passes the dict as a string arg; must use **kwargs.
-        return await tool._arun(**kwargs)
-
-    return StructuredTool.from_function(
-        coroutine=_arun,
-        name=tool.name,
-        description=tool.description,
-        args_schema=CleanSchema,
+    # --- 1. Replace args_schema ---
+    schema = tool.args_schema
+    # Pydantic v2 uses model_fields; v1 uses __fields__
+    original_fields = (
+        getattr(schema, "model_fields", None)
+        or getattr(schema, "__fields__", None)
+        or {}
     )
+    if original_fields:
+        # Build annotation/FieldInfo pairs without 'host'
+        clean_fields = {}
+        for k, v in original_fields.items():
+            if k == "host":
+                continue
+            # Pydantic v2 FieldInfo has .annotation; v1 ModelField has .outer_type_
+            annotation = getattr(v, "annotation", None) or getattr(v, "outer_type_", None) or str
+            clean_fields[k] = (annotation, v)
+
+        # Use __base__ (documented create_model param) to embed the ConfigDict
+        class _IgnoreExtraBase(BaseModel):
+            model_config = ConfigDict(extra="ignore")
+
+        CleanSchema = create_model(
+            f"{tool_name}_nohost",
+            __base__=_IgnoreExtraBase,
+            **clean_fields,
+        )
+        # args_schema is a typed Pydantic field on BaseTool; direct assignment works
+        tool.args_schema = CleanSchema
+        log.info("strip_host.schema_replaced", tool=tool_name, remaining_fields=list(clean_fields.keys()))
+    else:
+        log.warning("strip_host.no_schema_fields", tool=tool_name, schema_type=type(schema).__name__)
+
+    # --- 2. Monkey-patch _arun ---
+    # _arun is a class method (non-data descriptor), so instance __dict__ takes precedence.
+    # object.__setattr__ bypasses Pydantic's __setattr__ to write directly to __dict__.
+    original_arun = tool._arun  # capture bound method before replacement
+
+    async def _patched_arun(**kwargs):
+        had_host = "host" in kwargs
+        kwargs.pop("host", None)
+        if "since" in kwargs and isinstance(kwargs.get("since"), str) and "T" in kwargs["since"]:
+            kwargs["since"] = kwargs["since"].replace("T", " ").rstrip("Z")
+        log.info("strip_host.call", tool=tool_name, had_host=had_host, kwargs_keys=list(kwargs.keys()))
+        return await original_arun(**kwargs)
+
+    object.__setattr__(tool, "_arun", _patched_arun)
+    log.info("strip_host.patched", tool=tool_name)
+    return tool
 
 
 async def build_agent() -> ThreatResponseAgent:
