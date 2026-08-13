@@ -388,28 +388,60 @@ _REPORT_REQUIRED_KEYS = {"incident_id", "rule", "host", "verdict", "summary"}
 
 def _extract_json(text: str) -> dict[str, Any]:
     """
-    Pull the last ```json ... ``` block from the agent's final message that
-    looks like a filled-in IncidentReport (has the required keys).
+    Extract an IncidentReport JSON object from agent text.
 
-    Guards against the model echoing the JSON Schema object itself (which is
-    also valid JSON but contains "properties"/"type" instead of report fields).
+    Tries in order:
+    1. ```json ... ``` fenced blocks (last to first)
+    2. Bare JSON object at the start of the text (model omitted fences)
+
+    Guards against template echoing (verdict contains placeholder text) and
+    against the model echoing the JSON Schema object (has 'properties'/'type'
+    instead of report fields).
     """
     import re
-    blocks = re.findall(r"```json\s*([\s\S]+?)\s*```", text, re.IGNORECASE)
-    if not blocks:
-        raise ValueError(f"No JSON block found in agent response:\n{text[:500]}")
 
-    # Walk blocks from last to first; return first one that has the report keys
+    def _is_valid_report(obj):
+        """True if obj has required keys and verdict is not a placeholder."""
+        if not isinstance(obj, dict):
+            return False
+        if not _REPORT_REQUIRED_KEYS.issubset(obj.keys()):
+            return False
+        verdict = obj.get("verdict", "")
+        # Reject placeholder values like "<confirmed_threat|...>"
+        if verdict.startswith("<") or "|" in verdict:
+            return False
+        return True
+
+    # 1. Try fenced blocks first (model usually wraps in ```json ... ```)
+    blocks = re.findall(r"```(?:json)?\s*([\s\S]+?)\s*```", text, re.IGNORECASE)
     for raw in reversed(blocks):
         try:
             obj = json.loads(raw)
+            if _is_valid_report(obj):
+                return obj
         except json.JSONDecodeError:
             continue
-        if isinstance(obj, dict) and _REPORT_REQUIRED_KEYS.issubset(obj.keys()):
-            return obj
 
-    # Last resort: try the last block and let Pydantic surface the real error
-    return json.loads(blocks[-1])
+    # 2. Try bare JSON — model returned valid JSON without fences
+    text_stripped = text.strip()
+    if text_stripped.startswith("{"):
+        try:
+            obj = json.loads(text_stripped)
+            if _is_valid_report(obj):
+                return obj
+        except json.JSONDecodeError:
+            pass
+
+    # 3. Scan for the last { ... } block that parses as valid report JSON
+    for match in reversed(list(re.finditer(r"\{[\s\S]+?\}", text))):
+        try:
+            obj = json.loads(match.group())
+            if _is_valid_report(obj):
+                return obj
+        except json.JSONDecodeError:
+            continue
+
+    raise ValueError(f"No JSON block found in agent response:\n{text[:500]}")
 
 
 def _strip_host_param(tool):
