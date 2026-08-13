@@ -62,8 +62,11 @@ async def _build_agent_background():
             _agent = await build_agent()
             log.info("agent.ready")
             return
-        except Exception as exc:
-            log.error("agent.startup_failed", error=str(exc), attempt=attempt, retry_in=delay)
+        except BaseException as exc:
+            # Catch BaseException not Exception: anyio raises ExceptionGroup /
+            # BaseExceptionGroup for TaskGroup failures, which are NOT subclasses
+            # of Exception and would silently kill the retry loop.
+            log.error("agent.startup_failed", error=str(exc), error_type=type(exc).__name__, attempt=attempt, retry_in=delay)
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60)  # cap at 60s between retries
 
