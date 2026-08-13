@@ -26,7 +26,7 @@ spec:
             - name: AGENT_PROVIDER
               value: "openai_compatible"
             - name: AGENT_MODEL
-              value: "deepseek-r1-distill-qwen-14b"
+              value: "gpt-oss-120b"
             - name: AGENT_BASE_URL
               value: "https://maas-rhdp.apps.maas.redhatworkshops.io/v1"
             - name: OPENAI_API_KEY

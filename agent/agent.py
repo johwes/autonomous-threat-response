@@ -29,7 +29,7 @@ log = structlog.get_logger()
 # Config (from environment)
 # ---------------------------------------------------------------------------
 
-AGENT_MODEL = os.getenv("AGENT_MODEL", "deepseek-r1-distill-qwen-14b")
+AGENT_MODEL = os.getenv("AGENT_MODEL", "gpt-oss-120b")
 AGENT_BASE_URL = os.getenv("AGENT_BASE_URL", "https://maas-rhdp.apps.maas.redhatworkshops.io/v1")
 
 # linux-mcp-server — read-only RHEL introspection (stdio over SSH)
@@ -373,9 +373,34 @@ async def build_agent() -> ThreatResponseAgent:
         }
     )
 
-    # Load all tools from both MCP servers
-    tools = await mcp_client.get_tools()
-    log.info("agent.tools_loaded", count=len(tools), names=[t.name for t in tools])
+    # Load tools from both MCP servers, then filter to only what the agent needs.
+    # Exposing all 120+ AAP tools causes model confusion; a tight allowlist keeps
+    # the tool-selection problem tractable.
+    LINUX_TOOLS = {
+        "get_process_info",
+        "get_audit_logs",
+        "get_journal_logs",
+        "get_network_connections",
+        "get_file_info",
+        "run_command",
+    }
+    AAP_TOOLS = {
+        "job_templates_list",
+        "job_templates_launch_create",
+        "jobs_retrieve",
+        "jobs_stdout_retrieve",
+    }
+    ALLOWED_TOOLS = LINUX_TOOLS | AAP_TOOLS
+
+    all_tools = await mcp_client.get_tools()
+    tools = [t for t in all_tools if t.name in ALLOWED_TOOLS]
+    skipped = [t.name for t in all_tools if t.name not in ALLOWED_TOOLS]
+    log.info(
+        "agent.tools_loaded",
+        count=len(tools),
+        names=[t.name for t in tools],
+        skipped_count=len(skipped),
+    )
 
     llm = _build_llm()
 
