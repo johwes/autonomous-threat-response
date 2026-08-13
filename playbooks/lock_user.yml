@@ -1,55 +1,51 @@
 ---
-# Lock a compromised user account pending investigation.
-# Prevents re-authentication while preserving the account and home directory
-# for forensic analysis.
+# Record a security incident audit entry for a user involved in an LPE event.
+# For demo purposes this writes an audit log rather than locking the account,
+# so the demo environment remains accessible after remediation.
 #
 # Extra vars expected:
-#   compromised_user: username of the account to lock
+#   compromised_user: username of the account involved
 #   target_host:      RHEL host to remediate
 
-- name: Lock compromised user account
+- name: Record security incident audit entry for user
   hosts: "{{ target_host }}"
   become: true
-  gather_facts: false
+  gather_facts: true
 
   tasks:
-    - name: Capture current user info (for audit trail)
+    - name: Ensure audit directory exists
+      ansible.builtin.file:
+        path: /var/log/security-incidents
+        state: directory
+        mode: '0750'
+        owner: root
+        group: root
+
+    - name: Capture current user info
       ansible.builtin.command:
         cmd: id {{ compromised_user }}
       register: user_info
       changed_when: false
 
-    - name: Log user info before lock
+    - name: Write incident audit entry
+      ansible.builtin.copy:
+        dest: "/var/log/security-incidents/{{ compromised_user }}-{{ ansible_date_time.iso8601_basic_short }}.txt"
+        content: |
+          SECURITY INCIDENT AUDIT RECORD
+          ================================
+          Timestamp  : {{ ansible_date_time.iso8601 }}
+          Host       : {{ target_host }}
+          User       : {{ compromised_user }}
+          User info  : {{ user_info.stdout }}
+          Reason     : User session involved in confirmed security incident
+          Rule       : Root Shell Spawned Directly by User Shell
+          CVE        : CVE-2026-31431 (Copy Fail — page cache corruption LPE)
+          Action     : Incident logged. Manual account review required.
+          Status     : PENDING REVIEW
+        mode: '0640'
+        owner: root
+        group: root
+
+    - name: Report audit entry written
       ansible.builtin.debug:
-        msg: "Locking account: {{ user_info.stdout }}"
-
-    - name: Lock the user account (disables password auth)
-      ansible.builtin.user:
-        name: "{{ compromised_user }}"
-        password_lock: true
-
-    - name: Expire the account immediately (disables all auth)
-      ansible.builtin.command:
-        cmd: chage -E 0 {{ compromised_user }}
-      changed_when: true
-
-    - name: Kill all active sessions for the user
-      ansible.builtin.command:
-        cmd: pkill -KILL -u {{ compromised_user }}
-      ignore_errors: true
-      changed_when: true
-
-    - name: Remove any authorized_keys to block SSH key auth
-      ansible.builtin.file:
-        path: "/home/{{ compromised_user }}/.ssh/authorized_keys"
-        state: absent
-
-    - name: Confirm account is locked
-      ansible.builtin.command:
-        cmd: passwd -S {{ compromised_user }}
-      register: passwd_status
-      changed_when: false
-
-    - name: Report lock status
-      ansible.builtin.debug:
-        msg: "Account status: {{ passwd_status.stdout }}"
+        msg: "Incident audit record written for user={{ compromised_user }} on host={{ target_host }}"

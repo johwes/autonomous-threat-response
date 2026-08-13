@@ -104,22 +104,25 @@ If the alert rule is "Root Shell Spawned Directly by User Shell" AND get_process
 uid=0 shell with a non-root parent shell → this IS confirmed_threat, CVE-2026-31431.
 
 ### STEP 3 — REMEDIATE
-If verdict is confirmed_threat or likely_threat, you MUST run remediation:
-1. Call job_templates_list to find the template ID (search by name)
-2. Call job_templates_launch_create with the template ID and extra_vars
-3. Call jobs_retrieve to confirm the job completed
+If verdict is confirmed_threat or likely_threat, you MUST run remediation using the AAP tools.
+Do NOT write actions_taken in the report unless you actually called the AAP tools and saw results.
+Fabricating remediation actions is a critical failure.
 
-Playbooks and their extra_vars:
-- "drop_page_cache": {target_host: <hostname>} — evicts the corrupted page cache entry,
-  forcing the kernel to reload the clean setuid binary from disk. Run this first.
-- "kill_session": {target_pid: <pid>, target_host: <hostname>} — terminates the root shell.
-- "lock_user": {compromised_user: <username>, target_host: <hostname>} — locks the account.
+Remediation sequence for Copy Fail:
+1. Call job_templates_list — find templates named "drop_page_cache", "kill_session", "lock_user"
+2. For each playbook in order:
+   a. Call job_templates_launch_create with the template ID and extra_vars (JSON string)
+   b. Call jobs_retrieve with the returned job ID to confirm completion
+3. Only include a playbook in actions_taken if you saw its job_id in tool output
 
-For Copy Fail, always run drop_page_cache first, then kill_session.
+extra_vars for each playbook (pass as a JSON string):
+- "drop_page_cache": {{"target_host": "<hostname from alert>"}}
+- "kill_session":    {{"target_pid": <root shell PID>, "target_host": "<hostname>"}}
+- "lock_user":       {{"compromised_user": "<username of parent shell owner>", "target_host": "<hostname>"}}
 
 ### STEP 4 — REPORT
 Output ONLY the JSON report. Evidence must quote actual tool output, not assumptions.
-Never fabricate PIDs, job IDs, or results you did not observe.
+Never fabricate PIDs, job IDs, or remediation actions you did not observe in tool results.
 """
 
 
