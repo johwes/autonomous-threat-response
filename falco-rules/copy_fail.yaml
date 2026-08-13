@@ -1,6 +1,3 @@
-- macro: spawned_process
-  condition: evt.type = execve and evt.dir=<
-
 - rule: Copy Fail AF_ALG Socket Created by Unprivileged Process
   desc: >
     Detects creation of an AF_ALG (kernel crypto API) socket by a non-root
