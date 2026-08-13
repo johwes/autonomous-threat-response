@@ -36,7 +36,7 @@ spec:
                   key: OPENAI_API_KEY
             # linux-mcp-server — reached via SSH into the RHEL VM (stdio transport)
             - name: LINUX_MCP_SSH_HOST
-              value: "10.128.1.141"  # rhel9-brown-loon-92 VM IP
+              value: "10.128.1.157"  # rhel9-brown-loon-92 VM IP
             - name: LINUX_MCP_SSH_USER
               value: "cloud-user"
             - name: LINUX_MCP_SSH_KEY_PATH

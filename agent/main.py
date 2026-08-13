@@ -48,14 +48,24 @@ _agent_task = None
 async def _build_agent_background():
     """Build the agent asynchronously so uvicorn can start serving /healthz
     immediately. SSH connections to the RHEL VM can take 10-30s; without this
-    the liveness probe kills the pod before startup completes."""
+    the liveness probe kills the pod before startup completes.
+
+    Retries indefinitely with exponential backoff so a transient SSH timeout
+    (e.g. VM IP change, cold start) doesn't permanently disable the agent."""
     global _agent
-    try:
-        log.info("agent.startup", msg="Building LangGraph agent with MCP tools (background)")
-        _agent = await build_agent()
-        log.info("agent.ready")
-    except Exception as exc:
-        log.error("agent.startup_failed", error=str(exc))
+    delay = 5
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            log.info("agent.startup", msg="Building LangGraph agent with MCP tools (background)", attempt=attempt)
+            _agent = await build_agent()
+            log.info("agent.ready")
+            return
+        except Exception as exc:
+            log.error("agent.startup_failed", error=str(exc), attempt=attempt, retry_in=delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)  # cap at 60s between retries
 
 
 @asynccontextmanager
