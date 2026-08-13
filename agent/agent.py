@@ -315,9 +315,13 @@ class ThreatResponseAgent:
             )
         # Strip model-specific channel tokens (e.g. gpt-oss-120b uses <|channel|>...<|message|>)
         if "<|message|>" in raw_content:
-            raw_content = raw_content.split("<|message|>", 1)[-1]
-        final_content = raw_content
-        ilog.info("llm.response", preview=str(final_content)[:300])
+            after_token = raw_content.split("<|message|>", 1)[-1].strip()
+            # If nothing after the token, try the part before it
+            final_content = after_token if after_token else raw_content.split("<|channel|>")[0].strip()
+        else:
+            final_content = raw_content
+        # Log full phase 2 response for debugging (first 1000 chars)
+        ilog.info("phase2.response_raw", length=len(raw_content), content=raw_content[:1000])
         ilog.info("phase2.complete")
 
         if not final_content or not final_content.strip():
@@ -378,53 +382,39 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 
 def _strip_host_param(tool):
-    """Return a wrapper tool with 'host' removed from the schema the model sees.
+    """Wrap a linux tool so 'host' is always stripped before calling it.
 
-    linux-mcp-server's 'host' parameter triggers a second SSH hop from the VM
-    back to a potentially stale IP. Since we already SSH into the VM to spawn
-    the server, all tools run locally — removing the param from the schema
-    prevents the model from ever generating it. The underlying tool accepts
-    calls without 'host' fine (it defaults to local execution mode).
+    linux-mcp-server's 'host' triggers a second SSH hop from the VM back to
+    itself (at a potentially stale IP). Since we already SSH into the VM to
+    spawn the server, all tools must run locally.
+
+    Previous attempts used Pydantic schema inspection to remove the field, but
+    that failed silently when MCP tools use Pydantic v1 schemas (model_fields
+    is absent → early return → original tool used unchanged). This version
+    ALWAYS wraps without any schema inspection.
     """
     from langchain_core.tools import StructuredTool
 
-    schema = tool.args_schema
-    if schema is None:
-        return tool
-    fields = getattr(schema, "model_fields", {})
-    if "host" not in fields:
-        return tool
-
-    new_fields = {
-        name: (info.annotation, info)
-        for name, info in fields.items()
-        if name != "host"
-    }
-    # model_config = ConfigDict(extra="ignore") so Pydantic silently drops any
-    # extra fields (including a hallucinated 'host') before they reach _arun.
-    from pydantic import ConfigDict
-    NewSchema = create_model(
-        schema.__name__ + "_nohost",
-        __config__=type("Config", (), {"extra": "ignore"}),
-        **new_fields,
-    )
-
     async def _arun(**kwargs):
+        # Always strip host — model hallucinates it from training even when
+        # it's absent from the schema description.
         kwargs.pop("host", None)
-        # Normalise 'since' timestamp: linux-mcp-server's journalctl wrapper
-        # accepts "YYYY-MM-DD HH:MM:SS" or relative ("-1h") but rejects ISO 8601
-        # with a Z suffix. Strip the T and Z to get the accepted format.
+        # Coerce ISO 8601 'since' to "YYYY-MM-DD HH:MM:SS": journalctl rejects
+        # timestamps with a T separator or trailing Z.
         if "since" in kwargs and isinstance(kwargs["since"], str):
             s = kwargs["since"]
             if "T" in s:
                 kwargs["since"] = s.replace("T", " ").rstrip("Z")
+        log.debug("linux_tool.call", tool=tool.name, kwargs=list(kwargs.keys()))
         return await tool.arun(kwargs)
 
     return StructuredTool.from_function(
         coroutine=_arun,
         name=tool.name,
         description=tool.description,
-        args_schema=NewSchema,
+        # Keep the original schema so the model knows what other params exist,
+        # but the wrapper ensures host never reaches the underlying tool.
+        args_schema=tool.args_schema,
     )
 
 
