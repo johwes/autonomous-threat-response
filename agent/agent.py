@@ -116,11 +116,11 @@ Remediation sequence for Copy Fail:
 3. Only include a playbook in actions_taken if you saw its job_id in tool output
 
 extra_vars for each playbook (pass as a JSON string):
-IMPORTANT: always use "10.128.1.141" as target_host — this is the static inventory IP for the
-RHEL VM in AAP. Do not use the hostname from the Falco alert as target_host.
-- "drop_page_cache": {{"target_host": "10.128.1.141"}}
-- "kill_session":    {{"target_pid": <root shell PID>, "target_host": "10.128.1.141"}}
-- "lock_user":       {{"compromised_user": "<username of parent shell owner>", "target_host": "10.128.1.141"}}
+IMPORTANT: always use "rhel9-brown-loon-92-ssh" as target_host — this is the Kubernetes Service
+DNS name for the RHEL VM, reachable from AAP within the same namespace.
+- "drop_page_cache": {{"target_host": "rhel9-brown-loon-92-ssh"}}
+- "kill_session":    {{"target_pid": <root shell PID>, "target_host": "rhel9-brown-loon-92-ssh"}}
+- "lock_user":       {{"compromised_user": "<username of parent shell owner>", "target_host": "rhel9-brown-loon-92-ssh"}}
 
 ### STEP 4 — REPORT
 Output ONLY the JSON report. Evidence must quote actual tool output, not assumptions.
