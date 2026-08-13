@@ -1,3 +1,6 @@
+- macro: spawned_process
+  condition: evt.type = execve and evt.dir=<
+
 - rule: Copy Fail AF_ALG Socket Created by Unprivileged Process
   desc: >
     Detects creation of an AF_ALG (kernel crypto API) socket by a non-root
@@ -17,16 +20,15 @@
 
 - rule: Copy Fail Splice into AF_ALG Socket
   desc: >
-    Detects splice() syscall targeting an AF_ALG socket from an unprivileged
-    process. Combined with AF_ALG socket creation, this is the core exploitation
-    primitive of CVE-2026-31431.
+    Detects splice() syscall where the source fd is a socket from an
+    unprivileged process. Combined with AF_ALG socket creation, this is
+    the core exploitation primitive of CVE-2026-31431.
   condition: >
     evt.type = splice and
     not user.uid = 0 and
-    fd.type = socket and
-    fd.sock.family = AF_ALG
+    fd.type = socket
   output: >
-    splice() into AF_ALG socket by unprivileged process — possible Copy Fail exploit
+    splice() on socket fd by unprivileged process — possible Copy Fail exploit
     (user=%user.name uid=%user.uid pid=%proc.pid
      comm=%proc.name parent=%proc.pname cmdline=%proc.cmdline
      container=%container.name)
@@ -40,11 +42,10 @@
     both Copy Fail (CVE-2026-31431) and Fragnesia (CVE-2026-46300) — the
     corrupted in-memory setuid binary executes attacker-controlled code.
   condition: >
-    evt.type = execve and
+    spawned_process and
     proc.pname in (su, sudo, newgrp, passwd, mount, umount) and
     user.uid = 0 and
-    proc.vpid != proc.pid and
-    spawned_process
+    proc.vpid != proc.pid
   output: >
     Setuid binary spawned root shell — possible LPE via page cache corruption
     (user=%user.name uid=%user.uid pid=%proc.pid

@@ -7,7 +7,7 @@
   condition: >
     evt.type in (unshare, clone) and
     not user.uid = 0 and
-    (evt.arg.flags contains CLONE_NEWUSER or evt.arg.namespaces contains user)
+    evt.arg.flags contains CLONE_NEWUSER
   output: >
     User namespace created by unprivileged process — possible Fragnesia exploit setup
     (user=%user.name uid=%user.uid pid=%proc.pid
@@ -43,7 +43,7 @@
     evt.type = sendmsg and
     not user.uid = 0 and
     fd.type = socket and
-    fd.sock.protocol = udp and
+    fd.l4proto = udp and
     evt.arg.size > 65000
   output: >
     Large UDP sendmsg by unprivileged process — possible Fragnesia GRO variant
@@ -52,12 +52,3 @@
      size=%evt.arg.size container=%container.name)
   priority: WARNING
   tags: [CVE-2026-46300, fragnesia, lpe, gro, page_cache]
-
-- rule: Setuid Binary Spawns Unexpected Root Shell
-  desc: >
-    See copy_fail.yaml — this shared indicator fires for both CVEs.
-    Defined once in copy_fail.yaml; listed here for reference only.
-  condition: "never"
-  output: "n/a"
-  priority: INFO
-  tags: [CVE-2026-46300, fragnesia, reference]
