@@ -395,9 +395,17 @@ def _strip_host_param(tool):
     """
     from langchain_core.tools import StructuredTool
 
+    # Build a schema identical to the original but with 'host' removed, so
+    # the model never sees the parameter and can't generate it.
+    original_schema = tool.args_schema
+    original_fields = getattr(original_schema, "model_fields", {}) if original_schema else {}
+    if original_fields:
+        clean_fields = {k: (v.annotation, v) for k, v in original_fields.items() if k != "host"}
+        CleanSchema = create_model(f"{tool.name}_nohost", **clean_fields)
+    else:
+        CleanSchema = original_schema
+
     async def _arun(**kwargs):
-        # Always strip host — model hallucinates it from training even when
-        # it's absent from the schema description.
         kwargs.pop("host", None)
         # Coerce ISO 8601 'since' to "YYYY-MM-DD HH:MM:SS": journalctl rejects
         # timestamps with a T separator or trailing Z.
@@ -405,16 +413,15 @@ def _strip_host_param(tool):
             s = kwargs["since"]
             if "T" in s:
                 kwargs["since"] = s.replace("T", " ").rstrip("Z")
-        log.debug("linux_tool.call", tool=tool.name, kwargs=list(kwargs.keys()))
-        return await tool.arun(kwargs)
+        # Call the underlying MCP tool's run method directly with cleaned kwargs.
+        # tool.arun(dict) passes the dict as a string arg; must use **kwargs.
+        return await tool._arun(**kwargs)
 
     return StructuredTool.from_function(
         coroutine=_arun,
         name=tool.name,
         description=tool.description,
-        # Keep the original schema so the model knows what other params exist,
-        # but the wrapper ensures host never reaches the underlying tool.
-        args_schema=tool.args_schema,
+        args_schema=CleanSchema,
     )
 
 
