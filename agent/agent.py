@@ -113,17 +113,17 @@ Job template IDs are fixed — do NOT call job_templates_list, use these IDs dir
 - kill_session    : id=8
 - lock_user       : id=11
 
-For each playbook:
-1. Call job_templates_launch_create with the template id and extra_vars
-2. Call jobs_retrieve with the job ID returned from the launch to confirm completion
-3. Only add to actions_taken if you saw a job ID returned from launch
+For each playbook, call sequentially (do NOT call jobs_retrieve before seeing the launch response):
+1. Call job_templates_launch_create — note the job "id" in the response
+2. Call jobs_retrieve with that job "id" to confirm status
+3. Only add to actions_taken if you saw a job ID in the launch response
 
-extra_vars (always use "rhel9-brown-loon-92-ssh" as target_host — the K8s Service DNS name):
-- drop_page_cache : {{"target_host": "rhel9-brown-loon-92-ssh"}}
-- kill_session    : {{"target_pid": <root shell PID from get_process_info>, "target_host": "rhel9-brown-loon-92-ssh"}}
-- lock_user       : {{"compromised_user": "<non-root username from parent process>", "target_host": "rhel9-brown-loon-92-ssh"}}
+CRITICAL: extra_vars MUST be passed as a JSON-encoded string, not a dict. Examples:
+- drop_page_cache : extra_vars='{{"target_host": "rhel9-brown-loon-92-ssh"}}'
+- kill_session    : extra_vars='{{"target_pid": "<PID>", "target_host": "rhel9-brown-loon-92-ssh"}}'
+- lock_user       : extra_vars='{{"compromised_user": "cloud-user", "target_host": "rhel9-brown-loon-92-ssh"}}'
 
-Run drop_page_cache first, then kill_session, then lock_user.
+Run drop_page_cache first, then kill_session, then lock_user. Each launch must complete before the next.
 
 ### STEP 4 — REPORT
 Output ONLY the JSON report. Evidence must quote actual tool output, not assumptions.
