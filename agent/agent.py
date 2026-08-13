@@ -81,6 +81,12 @@ You MUST call at least these linux-mcp-server tools before writing any report:
 - get_journal_logs: look for kernel panic/oops messages around the event time
 - get_network_connections: check for unexpected outbound connections from root shells
 
+IMPORTANT — linux tool parameters:
+- Do NOT pass a "host" parameter to linux tools. The tools already run directly on
+  the target RHEL VM (linux-mcp-server is spawned there via SSH). Passing "host"
+  causes a second SSH hop to a potentially stale IP and will fail.
+- Call tools with only the parameters they need (e.g. pid, since, lines).
+
 DO NOT write the incident report until you have called tools and seen their output.
 Responding without tool calls is a critical failure — you will be re-prompted.
 
@@ -154,9 +160,10 @@ def _build_llm():
 # ---------------------------------------------------------------------------
 
 class ThreatResponseAgent:
-    def __init__(self, graph, mcp_client: MultiServerMCPClient):
+    def __init__(self, graph, mcp_client: MultiServerMCPClient, llm):
         self._graph = graph
         self._mcp_client = mcp_client
+        self._llm = llm
 
     async def ainvoke(self, alert, incident_id: str) -> IncidentReport:
         host = alert.output_fields.get("container.name") or alert.hostname or "unknown"
@@ -260,44 +267,33 @@ class ThreatResponseAgent:
                 recommended_next_steps=["Manually investigate the Falco alert on the host"],
             )
 
-        # --- Phase 2: request the JSON report, grounded in the phase 1 tool output ---
+        # --- Phase 2: call the LLM directly (not the ReAct graph) to write the report ---
+        # We skip the graph here intentionally: the investigation is complete, no more tool calls
+        # are needed, and re-entering the graph could trigger another tool-calling round that
+        # interleaves with report generation. A direct LLM call is cheaper and more reliable.
         ilog.info("phase2.start", msg="Requesting structured report from agent")
         report_messages = final_messages + [HumanMessage(content=report_request)]
 
-        final_report_messages = None
-        async for event in self._graph.astream_events(
-            {"messages": report_messages}, version="v2"
-        ):
-            kind = event["event"]
-            name = event.get("name", "")
+        ilog.info("llm.thinking", model="phase2")
+        phase2_response = await self._llm.ainvoke(report_messages)
+        final_content = phase2_response.content if hasattr(phase2_response, "content") else str(phase2_response)
+        ilog.info("llm.response", preview=str(final_content)[:300])
+        ilog.info("phase2.complete")
 
-            if kind == "on_tool_start":
-                # Additional tool calls during report phase are fine (e.g. polling job status)
-                raw_input = event["data"].get("input") or {}
-                ilog.info("tool.call", tool=name, input=json.dumps(raw_input)[:300])
+        if not final_content or not final_content.strip():
+            ilog.error(
+                "agent.phase2_empty",
+                msg="Phase 2 LLM returned empty response — returning inconclusive",
+            )
+            return IncidentReport(
+                incident_id=incident_id,
+                rule=alert.rule,
+                host=host,
+                verdict="inconclusive",
+                summary="Agent investigated but failed to produce a structured report. Manual review required.",
+                recommended_next_steps=["Manually review Falco alert and tool output"],
+            )
 
-            elif kind == "on_tool_end":
-                raw_output = event["data"].get("output")
-                ilog.info("tool.result", tool=name, output=str(raw_output)[:500] if raw_output else "")
-
-            elif kind == "on_chat_model_start":
-                ilog.info("llm.thinking", model=name)
-
-            elif kind == "on_chat_model_end":
-                output = event["data"].get("output")
-                if output:
-                    content = output.content if hasattr(output, "content") else str(output)
-                    ilog.info("llm.response", preview=str(content)[:200])
-
-            elif kind == "on_chain_end" and name == "LangGraph":
-                output = event["data"].get("output", {})
-                final_report_messages = output.get("messages", [])
-                ilog.info("phase2.complete")
-
-        if not final_report_messages:
-            raise RuntimeError(f"Agent produced no report for incident {incident_id}")
-
-        final_content = final_report_messages[-1].content
         report_json = _extract_json(final_content)
         report = IncidentReport(**report_json)
         report.incident_id = incident_id
@@ -410,4 +406,4 @@ async def build_agent() -> ThreatResponseAgent:
         # Checkpoint not needed for stateless webhook processing
     )
 
-    return ThreatResponseAgent(graph, mcp_client)
+    return ThreatResponseAgent(graph, mcp_client, llm)
