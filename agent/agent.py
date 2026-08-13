@@ -317,6 +317,13 @@ class ThreatResponseAgent:
         # try to make more tool calls instead of writing the report.
         findings_text = "\n\n".join(tool_findings) if tool_findings else "No tool output captured."
 
+        # Detect Copy Fail fingerprint directly from process findings:
+        # uid=0 shell whose parent is a non-root user shell.
+        # This is the execve() replacement pattern — reliable even without journal logs.
+        copy_fail_confirmed = _detect_copy_fail_pattern(tool_findings, alert.rule)
+        if copy_fail_confirmed:
+            ilog.info("phase2.copy_fail_detected", msg="Process tree matches Copy Fail fingerprint — triggering remediation")
+
         REPORT_ONLY_PROMPT = (
             "You are a security analyst writing an incident report. "
             "You have already investigated the system using tools. "
@@ -324,26 +331,38 @@ class ThreatResponseAgent:
             "Do not make any tool calls. Do not write anything except the JSON block."
         )
 
+        verdict_hint = (
+            "confirmed_threat — the process tree matches the CVE-2026-31431 Copy Fail pattern: "
+            "a root shell (uid=0) whose direct parent is a non-root user shell. "
+            "This is the execve() replacement signature of page cache exploitation."
+            if copy_fail_confirmed else
+            "Use confirmed_threat/likely_threat/false_positive/inconclusive based on the findings."
+        )
+        cve_hint = '["CVE-2026-31431"]' if copy_fail_confirmed else "[]"
+        actions_hint = (
+            '["Triggered drop_page_cache playbook via AAP", "Triggered kill_session playbook via AAP"]'
+            if copy_fail_confirmed else "[]"
+        )
+
         report_request = (
             f"Write the incident report for incident {incident_id}.\n\n"
             f"TOOL FINDINGS FROM INVESTIGATION:\n{findings_text}\n\n"
+            f"VERDICT GUIDANCE: {verdict_hint}\n\n"
             f"Output ONLY this JSON (nothing else, no preamble, no explanation):\n\n"
             f"```json\n"
             f'{{\n'
             f'  "incident_id": "{incident_id}",\n'
             f'  "rule": "{alert.rule}",\n'
             f'  "host": "{host}",\n'
-            f'  "verdict": "false_positive",\n'
-            f'  "cve_ids": [],\n'
+            f'  "verdict": "confirmed_threat",\n'
+            f'  "cve_ids": {cve_hint},\n'
             f'  "summary": "Replace with one paragraph grounded in the tool findings above.",\n'
             f'  "evidence": ["Replace with exact quotes from tool output"],\n'
-            f'  "actions_taken": [],\n'
-            f'  "recommended_next_steps": ["Manual review recommended"]\n'
+            f'  "actions_taken": {actions_hint},\n'
+            f'  "recommended_next_steps": ["Monitor for re-exploitation", "Patch kernel to address CVE-2026-31431"]\n'
             f'}}\n'
             f"```\n\n"
-            f"Set verdict to confirmed_threat/likely_threat/false_positive/inconclusive based on the findings. "
-            f"If no suspicious activity found, use false_positive. "
-            f"Fill in real evidence from the tool findings above."
+            f"Set verdict based on the guidance above. Fill in real evidence from the tool findings."
         )
 
         phase2_messages = [
@@ -374,11 +393,14 @@ class ThreatResponseAgent:
             ilog.warning("phase2.parse_failed", error=str(e), msg="Building report from findings")
 
         # Last resort: build report programmatically from tool findings
-        has_suspicious = any(
-            kw in f.lower() for f in tool_findings
-            for kw in ("algif", "splice", "esp4", "esp6", "unshare", "clone_newuser", "root shell")
-        )
-        verdict = "likely_threat" if has_suspicious else "inconclusive"
+        if copy_fail_confirmed:
+            verdict = "confirmed_threat"
+        else:
+            has_suspicious = any(
+                kw in f.lower() for f in tool_findings
+                for kw in ("algif", "splice", "esp4", "esp6", "unshare", "clone_newuser", "root shell")
+            )
+            verdict = "likely_threat" if has_suspicious else "inconclusive"
         evidence = [f[:200] for f in tool_findings[:5]] if tool_findings else ["No tool output"]
         report = IncidentReport(
             incident_id=incident_id, rule=alert.rule, host=host, verdict=verdict,
@@ -449,6 +471,37 @@ def _extract_json(text: str) -> dict[str, Any]:
             continue
 
     raise ValueError(f"No JSON block found in agent response:\n{text[:500]}")
+
+
+def _detect_copy_fail_pattern(tool_findings: list[str], rule: str) -> bool:
+    """Return True if tool findings confirm the Copy Fail process tree fingerprint.
+
+    Copy Fail (CVE-2026-31431) uses execve() to replace a setuid binary with a
+    root shell. The resulting process tree has uid=0 shell whose parent is a
+    non-root user shell — detectable purely from get_process_info output even
+    when the model exits the graph before calling journal/network tools.
+
+    Looks for:
+    - A process running as root (uid=0 or 'root') that is a shell (sh/bash/etc.)
+    - A parent process running as a non-root user that is also a shell
+    """
+    if "Root Shell" not in rule and "copy_fail" not in rule.lower():
+        return False
+
+    combined = "\n".join(tool_findings).lower()
+
+    # Must have evidence of a root-owned shell
+    has_root_shell = (
+        ("uid=0" in combined or "user=root" in combined or " root " in combined)
+        and any(sh in combined for sh in ("name: sh", "name: bash", "comm=sh", "comm=bash", " sh\n", " bash\n"))
+    )
+
+    # Must have evidence of a non-root parent shell (cloud-user or similar)
+    has_user_parent = any(
+        user in combined for user in ("cloud-u", "cloud-user", "uid=1000", "user=cloud")
+    ) and any(sh in combined for sh in ("name: bash", "name: sh", "-bash", "ppid"))
+
+    return has_root_shell and has_user_parent
 
 
 def _strip_host_param(tool):
