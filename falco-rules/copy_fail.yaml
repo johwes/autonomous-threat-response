@@ -1,27 +1,27 @@
 - rule: Copy Fail AF_ALG Socket Created by Unprivileged Process
   desc: >
-    Detects creation of an AF_ALG (kernel crypto API) socket by a non-root
-    process on the host. CVE-2026-31431 (Copy Fail) requires opening an AF_ALG
-    socket as the first step before using splice() to corrupt the page cache.
+    Detects creation of a socket by a non-root host process as an early
+    indicator of CVE-2026-31431 (Copy Fail). The follow-up splice rule
+    (below) confirms exploitation via the algif fd name. This rule fires
+    broadly on socket() — tune or disable if too noisy for your environment.
   condition: >
     evt.type = socket and
-    evt.arg.domain = 38 and
     not container and
     not user.uid = 0
   output: >
-    AF_ALG socket opened by unprivileged host process
+    socket() called by unprivileged host process — possible Copy Fail early indicator
     (user=%user.name uid=%user.uid pid=%proc.pid
      comm=%proc.name parent=%proc.pname cmdline=%proc.cmdline
      container=%container.name)
   priority: WARNING
+  enabled: false
   tags: [CVE-2026-31431, copy_fail, lpe, page_cache]
 
 - rule: Copy Fail Splice into AF_ALG Socket
   desc: >
-    Detects splice() syscall from an unprivileged host process where the fd name
-    suggests an algif (ALG interface) socket — the kernel's name for AF_ALG
-    file descriptors. Combined with AF_ALG socket creation, this is the core
-    exploitation primitive of CVE-2026-31431.
+    Detects splice() from an unprivileged host process where the fd name
+    contains "algif" — the kernel's name for AF_ALG (crypto API) socket
+    file descriptors. This is the core exploitation primitive of CVE-2026-31431.
   condition: >
     evt.type = splice and
     not container and
@@ -37,10 +37,11 @@
 
 - rule: Setuid Binary Spawns Unexpected Root Shell
   desc: >
-    Detects a setuid binary (e.g. /usr/bin/su) spawning a shell as root on the
-    host. This is the post-exploitation indicator for both Copy Fail
-    (CVE-2026-31431) and Fragnesia (CVE-2026-46300) — the corrupted in-memory
-    setuid binary executes attacker-controlled code.
+    Detects a non-shell setuid binary (su, passwd, newgrp, mount, umount)
+    spawning a shell as root on the host. This is the post-exploitation
+    indicator for both Copy Fail (CVE-2026-31431) and Fragnesia
+    (CVE-2026-46300) — the corrupted in-memory setuid binary executes
+    attacker-controlled code.
   condition: >
     spawned_process and
     not container and
