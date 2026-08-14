@@ -53,7 +53,7 @@ AAP_TEMPLATE_IDS = {
     "drop_page_cache":       10,
     "kill_session":           8,
     "lock_user":             11,
-    "write_incident_report":  0,   # TODO: set after creating template in AAP
+    "write_incident_report":  12,
 }
 
 LINUX_TOOLS = {
