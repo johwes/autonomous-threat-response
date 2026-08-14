@@ -204,13 +204,15 @@ async def _node_process_inspect(
 
     proc_root = ""
     proc_parent = ""
-    ppid = None
+    # Prefer proc.ppid from output_fields (added to Falco rule output);
+    # fall back to regex extraction from the get_process_info result.
+    ppid = alert.output_fields.get("proc.ppid") or alert.output_fields.get("ppid")
 
     if root_pid:
         proc_root = await _call_tool(gpi, {"pid": str(root_pid)}, ilog, "root_shell")
-        # Extract parent PID from the result
-        ppid = _extract_ppid(proc_root)
-        ilog.info("node1.ppid", ppid=ppid)
+        if not ppid:
+            ppid = _extract_ppid(proc_root)
+        ilog.info("node1.ppid", ppid=ppid, source="output_fields" if alert.output_fields.get("proc.ppid") else "proc_text")
 
     if ppid:
         proc_parent = await _call_tool(gpi, {"pid": str(ppid)}, ilog, "parent_shell")

@@ -52,7 +52,7 @@
     proc.pname in (bash, sh, dash, zsh, ksh, ksh93, tcsh, csh, fish, rbash, rzsh)
   output: >
     Root shell spawned directly by user shell — possible LPE via page cache corruption
-    (user=%user.name uid=%user.uid pid=%proc.pid
+    (user=%user.name uid=%user.uid pid=%proc.pid ppid=%proc.ppid
      comm=%proc.name parent=%proc.pname cmdline=%proc.cmdline
      pcmdline=%proc.pcmdline container=%container.name)
   priority: CRITICAL
