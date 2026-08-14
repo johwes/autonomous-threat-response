@@ -539,8 +539,10 @@ class ThreatResponseAgent:
         self._llm         = llm
 
     async def ainvoke(self, alert, incident_id: str) -> IncidentReport:
+        container_name = alert.output_fields.get("container.name", "")
         host = (
-            alert.output_fields.get("container.name")
+            # "host" is Falco's sentinel meaning "not a container" — ignore it
+            (container_name if container_name and container_name != "host" else None)
             or alert.hostname
             or AAP_TARGET_HOST
         )
