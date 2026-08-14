@@ -86,6 +86,18 @@ The LLM never selects tools, never formats arguments, never decides what step co
 | Remediation | Ansible Automation Platform 2.6 + AAP MCP Server | Auditable, pre-approved playbook execution |
 | Deployment | OpenShift (same namespace as AAP) | Agent pod, image build via BuildConfig |
 
+## Exploit Code
+
+The Copy Fail PoC used in the demo is at **https://github.com/xeloxa/copyfail-exploit**.
+
+Clone it onto the target RHEL 9 host as a low-privilege user. The exploit requires Python 3.11 — install it first:
+
+```bash
+sudo dnf install python3.11 -y
+git clone https://github.com/xeloxa/copyfail-exploit
+cd copyfail-exploit
+```
+
 ## Demo Flow
 
 1. **SSH in as cloud-user** on `rhel9-brown-loon-92`.
