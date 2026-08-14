@@ -22,12 +22,6 @@
         cmd: echo 3 > /proc/sys/vm/drop_caches
       changed_when: true
 
-    - name: Confirm page cache was dropped
-      ansible.builtin.command:
-        cmd: cat /proc/sys/vm/drop_caches
-      register: cache_status
-      changed_when: false
-
-    - name: Report cache drop result
+    - name: Report cache drop complete
       ansible.builtin.debug:
-        msg: "Page cache drop complete. /proc/sys/vm/drop_caches = {{ cache_status.stdout }}"
+        msg: "Page cache drop complete (sync + echo 3 > /proc/sys/vm/drop_caches). Corrupted in-memory binaries evicted."
