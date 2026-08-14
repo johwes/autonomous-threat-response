@@ -1,55 +1,74 @@
 """
-LangGraph ReAct agent that investigates Falco alerts and triggers remediation.
+Autonomous Threat Response Agent — deterministic StateGraph pipeline.
 
-Investigation tools come from linux-mcp-server (read-only host introspection).
-Remediation tools come from Ansible Automation Platform MCP server.
+Five nodes, each with a single responsibility:
+  1. process_inspect  — pure Python: get_process_info on root shell + parent
+  2. host_triage      — pure Python: get_journal_logs + get_network_connections
+  3. classify         — LLM-only (no tools): structured verdict + CVE
+  4. remediate        — pure Python: deterministic AAP playbook dispatch
+  5. report           — LLM: write one plain-text summary paragraph
 
-The agent is model-agnostic: swap AGENT_MODEL env var to use any LangChain
-chat model (Anthropic, OpenAI, Azure, Bedrock, etc.).
+The LLM is only consulted in nodes 3 and 5, and only given a narrow prompt
+with a single concrete few-shot trajectory. It never selects tools, never
+formats JSON, never decides what to do next. All control flow is Python.
 
-Agent activity is streamed to stdout via astream_events() so that:
-  - `oc logs -f <pod>` gives a live play-by-play of every tool call and decision
-  - LangSmith tracing (LANGCHAIN_TRACING_V2=true) gives a visual trace UI
+Investigation tools: linux-mcp-server via SSH stdio.
+Remediation tools:   AAP MCP server via streamable-HTTP.
 """
+
+from __future__ import annotations
 
 import json
 import os
-from typing import Any, Literal
+import re
+from typing import Any, Literal, Optional
 
 import structlog
-from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.prebuilt import create_react_agent
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, Field
 
 log = structlog.get_logger()
 
 # ---------------------------------------------------------------------------
-# Config (from environment)
+# Config
 # ---------------------------------------------------------------------------
 
-AGENT_MODEL = os.getenv("AGENT_MODEL", "gpt-oss-120b")
+AGENT_MODEL    = os.getenv("AGENT_MODEL",    "gpt-oss-120b")
 AGENT_BASE_URL = os.getenv("AGENT_BASE_URL", "https://maas-rhdp.apps.maas.redhatworkshops.io/v1")
 
-# linux-mcp-server — read-only RHEL introspection (stdio over SSH)
-# The server runs on the RHEL VM; we reach it by SSHing in and spawning it.
 LINUX_MCP_SSH_HOST = os.getenv("LINUX_MCP_SSH_HOST", "rhel-host")
 LINUX_MCP_SSH_USER = os.getenv("LINUX_MCP_SSH_USER", "root")
-LINUX_MCP_SSH_KEY = os.getenv("LINUX_MCP_SSH_KEY_PATH", "/ssh/id_rsa")
-LINUX_MCP_CMD = os.getenv("LINUX_MCP_CMD", "linux-mcp-server")
+LINUX_MCP_SSH_KEY  = os.getenv("LINUX_MCP_SSH_KEY_PATH", "/ssh/id_rsa")
+LINUX_MCP_CMD      = os.getenv("LINUX_MCP_CMD", "linux-mcp-server")
 
-# Ansible Automation Platform MCP server — remediation playbooks
-# Uses MCP streamable-HTTP transport (2024-11-05 spec): POST /mcp with
-# Accept: application/json, text/event-stream and Mcp-Session-Id header.
 AAP_MCP_URL = os.getenv(
     "AAP_MCP_URL",
     "https://sandbox-aap-mcp-rhn-sa-jwesterl-dev.apps.rm3.7wse.p1.openshiftapps.com/mcp",
 )
 AAP_TOKEN = os.getenv("AAP_TOKEN", "")
 
+AAP_TARGET_HOST  = "rhel9-brown-loon-92-ssh"
+AAP_TEMPLATE_IDS = {
+    "drop_page_cache": 10,
+    "kill_session":     8,
+    "lock_user":       11,
+}
+
+LINUX_TOOLS = {
+    "get_process_info",
+    "get_journal_logs",
+    "get_network_connections",
+    "get_file_info",
+    "run_command",
+}
+AAP_TOOLS = {
+    "job_templates_launch_create",
+    "jobs_retrieve",
+}
+
 # ---------------------------------------------------------------------------
-# Output schema
+# Public output schema (returned from ainvoke)
 # ---------------------------------------------------------------------------
 
 class IncidentReport(BaseModel):
@@ -65,88 +84,27 @@ class IncidentReport(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# System prompt
+# Internal LLM output schemas (structured output — no JSON parsing needed)
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are an autonomous defensive security agent protecting a RHEL host.
-You behave like an experienced security engineer: you gather evidence first, reason from it, then act.
-
-You receive Falco alerts indicating potential Linux Privilege Escalation (LPE) exploitation.
-
-## MANDATORY WORKFLOW — follow these steps in order, no exceptions
-
-### STEP 1 — INVESTIGATE
-Call these tools before writing anything:
-1. get_process_info: look up the suspicious PID from the alert, then look up its parent PID
-2. get_journal_logs: search for exploit signals around the alert time (use since="-15m")
-3. get_network_connections: check for unexpected outbound connections from root processes
-
-Available linux tools (do NOT use any other tool names — they do not exist):
-  get_process_info, get_journal_logs, get_network_connections, get_file_info, run_command
-
-CRITICAL — linux tool parameters:
-- Do NOT pass a "host" parameter. Tools run directly on the target VM via SSH.
-- For get_journal_logs "since": use ONLY relative format: "-15m", "-1h", "-2h".
-  NEVER use ISO 8601 (e.g. "2026-08-13T06:00:00Z") — journalctl will reject it.
-
-### STEP 2 — ASSESS
-Determine which CVE pattern the evidence matches:
-
-CVE-2026-31431 (Copy Fail): AF_ALG socket + splice() corrupts page cache of a setuid binary.
-  Post-exploitation indicator: root shell (uid=0) whose parent process is a USER shell (bash/sh
-  running as non-root). This is the execve() replacement pattern — the corrupted binary replaces
-  itself with a shell, so the root shell's PPID is the attacker's original session, not su/sudo.
-
-CVE-2026-46300 (Fragnesia): user namespace + XFRM ESP corrupts page cache.
-  Indicators: unshare(CLONE_NEWUSER), esp4/esp6 module load, then same root shell pattern.
-
-If the alert rule is "Root Shell Spawned Directly by User Shell" AND get_process_info confirms
-uid=0 shell with a non-root parent shell → this IS confirmed_threat, CVE-2026-31431.
-
-### STEP 3 — REMEDIATE
-If verdict is confirmed_threat or likely_threat, you MUST run remediation using the AAP tools.
-Do NOT write actions_taken in the report unless you actually called the AAP tools and saw results.
-Fabricating remediation actions is a critical failure.
-
-Job template IDs are fixed — do NOT call job_templates_list, use these IDs directly:
-- drop_page_cache : id=10
-- kill_session    : id=8
-- lock_user       : id=11
-
-For each playbook, call sequentially (do NOT call jobs_retrieve before seeing the launch response):
-1. Call job_templates_launch_create — note the job "id" in the response
-2. Call jobs_retrieve with that job "id" to confirm status
-3. Only add to actions_taken if you saw a job ID in the launch response
-
-CRITICAL: extra_vars MUST be passed as a JSON-encoded string, not a dict. Examples:
-- drop_page_cache : extra_vars='{{"target_host": "rhel9-brown-loon-92-ssh"}}'
-- kill_session    : extra_vars='{{"target_pid": "<PID>", "target_host": "rhel9-brown-loon-92-ssh"}}'
-- lock_user       : extra_vars='{{"compromised_user": "cloud-user", "target_host": "rhel9-brown-loon-92-ssh"}}'
-
-Run drop_page_cache first, then kill_session, then lock_user. Each launch must complete before the next.
-
-### STEP 4 — REPORT
-Output ONLY the JSON report. Evidence must quote actual tool output, not assumptions.
-Never fabricate PIDs, job IDs, or remediation actions you did not observe in tool results.
-"""
+class ClassifyResult(BaseModel):
+    verdict: Literal["confirmed_threat", "likely_threat", "false_positive", "inconclusive"]
+    cve_ids: list[str] = Field(default_factory=list)
+    confidence_notes: str
 
 
 # ---------------------------------------------------------------------------
-# LLM factory — model-agnostic
+# LLM factory
 # ---------------------------------------------------------------------------
 
 def _build_llm():
-    """
-    Build a LangChain chat model from the AGENT_MODEL env var.
-    Defaults to Claude Opus 4.8 with extended thinking.
-    Add branches here to support other providers.
-    """
     provider = os.getenv("AGENT_PROVIDER", "anthropic").lower()
 
     if provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic
         return ChatAnthropic(
             model=AGENT_MODEL,
-            max_tokens=16000,
+            max_tokens=8000,
             thinking={"type": "adaptive"},
             streaming=True,
         )
@@ -161,10 +119,7 @@ def _build_llm():
 
     if provider == "azure":
         from langchain_openai import AzureChatOpenAI
-        return AzureChatOpenAI(
-            azure_deployment=AGENT_MODEL,
-            streaming=True,
-        )
+        return AzureChatOpenAI(azure_deployment=AGENT_MODEL, streaming=True)
 
     if provider == "bedrock":
         from langchain_aws import ChatBedrock
@@ -174,459 +129,571 @@ def _build_llm():
 
 
 # ---------------------------------------------------------------------------
-# Agent construction (called once at startup)
+# Tool host-param stripper  (linux-mcp-server runs locally on the VM)
 # ---------------------------------------------------------------------------
 
-AAP_TARGET_HOST = "rhel9-brown-loon-92-ssh"
-AAP_TEMPLATE_IDS = {
-    "drop_page_cache": 10,
-    "kill_session": 8,
-    "lock_user": 11,
-}
-
-
-class ThreatResponseAgent:
-    def __init__(self, graph, mcp_client: MultiServerMCPClient, llm, aap_tools: dict):
-        self._graph = graph
-        self._mcp_client = mcp_client
-        self._llm = llm
-        self._aap_tools = aap_tools  # name -> tool object
-
-    async def _run_aap_remediation(self, ilog, root_pid) -> list[str]:
-        """Programmatically launch AAP playbooks without going through the LLM.
-
-        Used in the fallback path when the graph exits early but we've already
-        confirmed the Copy Fail fingerprint from process findings.
-        """
-        launch_tool = self._aap_tools.get("job_templates_launch_create")
-        retrieve_tool = self._aap_tools.get("jobs_retrieve")
-        if not launch_tool or not retrieve_tool:
-            ilog.warning("aap.tools_missing", msg="AAP tools not available for programmatic remediation")
-            return []
-
-        actions = []
-        playbooks = [
-            ("drop_page_cache", AAP_TEMPLATE_IDS["drop_page_cache"],
-             json.dumps({"target_host": AAP_TARGET_HOST})),
-            ("kill_session", AAP_TEMPLATE_IDS["kill_session"],
-             json.dumps({"target_pid": str(root_pid), "target_host": AAP_TARGET_HOST})),
-            ("lock_user", AAP_TEMPLATE_IDS["lock_user"],
-             json.dumps({"compromised_user": "cloud-user", "target_host": AAP_TARGET_HOST})),
-        ]
-
-        for name, template_id, extra_vars in playbooks:
-            try:
-                ilog.info("aap.launch", playbook=name, template_id=template_id)
-                launch_result = await launch_tool.ainvoke(
-                    {"id": str(template_id), "extra_vars": extra_vars}
-                )
-                result_text = str(launch_result)
-                # Extract job ID from response
-                job_id = None
-                try:
-                    import re
-                    m = re.search(r'"id":\s*(\d+)', result_text)
-                    if m:
-                        job_id = m.group(1)
-                except Exception:
-                    pass
-
-                if job_id:
-                    ilog.info("aap.launched", playbook=name, job_id=job_id)
-                    retrieve_result = await retrieve_tool.ainvoke({"id": job_id})
-                    ilog.info("aap.retrieved", playbook=name, job_id=job_id, result=str(retrieve_result)[:200])
-                    actions.append(f"{name} (job_id={job_id})")
-                else:
-                    ilog.warning("aap.no_job_id", playbook=name, result=result_text[:300])
-            except Exception as exc:
-                ilog.error("aap.launch_failed", playbook=name, error=str(exc))
-
-        return actions
-
-    async def ainvoke(self, alert, incident_id: str) -> IncidentReport:
-        host = alert.output_fields.get("container.name") or alert.hostname or "unknown"
-        ilog = log.bind(incident_id=incident_id, host=host, rule=alert.rule)
-
-        user_message = (
-            f"Falco alert received. Investigate and report.\n\n"
-            f"**Alert Rule:** {alert.rule}\n"
-            f"**Priority:** {alert.priority}\n"
-            f"**Host:** {host}\n"
-            f"**Time:** {alert.time}\n"
-            f"**Tags:** {', '.join(alert.tags)}\n"
-            f"**Raw output:** {alert.output}\n"
-            f"**Output fields:**\n```json\n{json.dumps(alert.output_fields, indent=2)}\n```\n\n"
-            f"Incident ID: {incident_id}\n\n"
-            f"Follow the MANDATORY WORKFLOW:\n"
-            f"1. Call get_process_info, get_journal_logs, get_network_connections\n"
-            f"2. If threat confirmed, remediate: job_templates_list → job_templates_launch_create → jobs_retrieve\n"
-            f"3. When done with all tool calls, output ONLY the JSON incident report (no other text):\n\n"
-            f"```json\n"
-            f'{{\n'
-            f'  "incident_id": "{incident_id}",\n'
-            f'  "rule": "{alert.rule}",\n'
-            f'  "host": "{host}",\n'
-            f'  "verdict": "<confirmed_threat|likely_threat|false_positive|inconclusive>",\n'
-            f'  "cve_ids": [],\n'
-            f'  "summary": "<one paragraph grounded in tool output>",\n'
-            f'  "evidence": ["<exact finding from tool output>"],\n'
-            f'  "actions_taken": ["<actual remediation steps taken>"],\n'
-            f'  "recommended_next_steps": ["<follow-up>"]\n'
-            f'}}\n'
-            f"```"
-        )
-
-        messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=user_message),
-        ]
-
-        ilog.info("agent.start")
-
-        final_messages = None
-        tool_call_count = 0
-        last_ai_content = ""
-        tool_findings = []
-
-        # Run with higher recursion_limit to allow the model to make all tool calls
-        # it needs before writing the report. Default is 25; we allow 50.
-        config = {"recursion_limit": 50}
-
-        async for event in self._graph.astream_events({"messages": messages}, config=config, version="v2"):
-            kind = event["event"]
-            name = event.get("name", "")
-
-            if kind == "on_tool_start":
-                tool_call_count += 1
-                raw_input = event["data"].get("input") or {}
-                input_preview = json.dumps(raw_input)[:300]
-                ilog.info("tool.call", tool=name, input=input_preview, call_n=tool_call_count)
-
-            elif kind == "on_tool_end":
-                raw_output = event["data"].get("output")
-                output_str = str(raw_output)[:2000] if raw_output is not None else ""
-                output_preview = output_str[:500]
-                ilog.info("tool.result", tool=name, output=output_preview)
-                # Accumulate tool findings for phase 2 fallback
-                tool_findings.append(f"[{name}]:\n{output_str}")
-
-            elif kind == "on_chat_model_start":
-                ilog.info("llm.thinking", model=name)
-
-            elif kind == "on_chat_model_end":
-                output = event["data"].get("output")
-                if output:
-                    content = output.content if hasattr(output, "content") else str(output)
-                    content_str = str(content)
-                    if content_str.strip():
-                        last_ai_content = content_str
-                    ilog.info("llm.response", preview=content_str[:300])
-
-            elif kind == "on_chain_end" and name == "LangGraph":
-                output = event["data"].get("output", {})
-                final_messages = output.get("messages", [])
-                ilog.info("graph.complete", tool_calls=tool_call_count)
-
-        if not final_messages:
-            raise RuntimeError(f"Agent produced no output for incident {incident_id}")
-
-        if tool_call_count == 0:
-            ilog.error("agent.no_tools", msg="Model called no tools")
-            return IncidentReport(
-                incident_id=incident_id, rule=alert.rule, host=host,
-                verdict="inconclusive",
-                summary="Agent failed to perform investigation (no tool calls). Manual review required.",
-                recommended_next_steps=["Manually investigate the Falco alert on the host"],
-            )
-
-        # --- Try to extract a report from the graph's final AIMessage ---
-        final_text = ""
-        for msg in reversed(final_messages):
-            msg_type = type(msg).__name__
-            # AIMessages have content but no tool_call_id (that's ToolMessage)
-            if msg_type in ("AIMessage", "AIMessageChunk") or (
-                hasattr(msg, "content") and not hasattr(msg, "tool_call_id") and not hasattr(msg, "role")
-            ):
-                content = msg.content
-                if isinstance(content, list):
-                    content = "\n".join(
-                        c.get("text", "") if isinstance(c, dict) else str(c)
-                        for c in content
-                    )
-                content = str(content)
-                # Strip model-specific channel tokens (gpt-oss-120b emits these)
-                if "<|message|>" in content:
-                    after = content.split("<|message|>", 1)[-1].strip()
-                    content = after if after else content.split("<|channel|>")[0].strip()
-                if content.strip():
-                    final_text = content
-                    break
-
-        if not final_text and last_ai_content:
-            final_text = last_ai_content
-
-        ilog.info("agent.final_text", length=len(final_text), preview=final_text[:300])
-
-        # Try to parse the report from the graph's final text — if it succeeded
-        # with remediation already done, use it directly and we're done.
-        try:
-            report_json = _extract_json(final_text)
-            report = IncidentReport(**report_json)
-            report.incident_id = incident_id
-            report.host = host
-            ilog.info("incident.report", verdict=report.verdict, cves=report.cve_ids, actions=len(report.actions_taken))
-            return report
-        except (ValueError, Exception) as e:
-            ilog.warning("agent.graph_report_failed", error=str(e), msg="Falling back to direct LLM report call")
-
-        # --- Fallback: direct LLM call with tool findings summary ---
-        # The model didn't write the JSON report as its final response.
-        # Detect the Copy Fail fingerprint from process findings and trigger
-        # AAP remediation programmatically — no LLM needed for that part.
-        findings_text = "\n\n".join(tool_findings) if tool_findings else "No tool output captured."
-
-        # Detect Copy Fail fingerprint directly from process findings and the rule name.
-        copy_fail_confirmed = _detect_copy_fail_pattern(tool_findings, alert.rule)
-
-        # Extract root shell PID from the Falco alert output_fields
-        root_pid = alert.output_fields.get("proc.pid") or alert.output_fields.get("pid")
-
-        actions_taken = []
-        if copy_fail_confirmed:
-            ilog.info("phase2.copy_fail_detected", msg="Process tree matches Copy Fail — triggering AAP remediation")
-            actions_taken = await self._run_aap_remediation(ilog, root_pid)
-
-        REPORT_ONLY_PROMPT = (
-            "You are a security analyst writing an incident report. "
-            "You have already investigated the system using tools. "
-            "Your ONLY job now is to output a JSON incident report. "
-            "Do not make any tool calls. Do not write anything except the JSON block."
-        )
-
-        verdict_hint = (
-            "confirmed_threat — the process tree matches the CVE-2026-31431 Copy Fail pattern: "
-            "a root shell (uid=0) whose direct parent is a non-root user shell. "
-            "This is the execve() replacement signature of page cache exploitation."
-            if copy_fail_confirmed else
-            "Use confirmed_threat/likely_threat/false_positive/inconclusive based on the findings."
-        )
-        cve_hint = '["CVE-2026-31431"]' if copy_fail_confirmed else "[]"
-        actions_hint = json.dumps(actions_taken) if actions_taken else "[]"
-
-        report_request = (
-            f"Write the incident report for incident {incident_id}.\n\n"
-            f"TOOL FINDINGS FROM INVESTIGATION:\n{findings_text}\n\n"
-            f"VERDICT GUIDANCE: {verdict_hint}\n\n"
-            f"Output ONLY this JSON (nothing else, no preamble, no explanation):\n\n"
-            f"```json\n"
-            f'{{\n'
-            f'  "incident_id": "{incident_id}",\n'
-            f'  "rule": "{alert.rule}",\n'
-            f'  "host": "{host}",\n'
-            f'  "verdict": "confirmed_threat",\n'
-            f'  "cve_ids": {cve_hint},\n'
-            f'  "summary": "Replace with one paragraph grounded in the tool findings above.",\n'
-            f'  "evidence": ["Replace with exact quotes from tool output"],\n'
-            f'  "actions_taken": {actions_hint},\n'
-            f'  "recommended_next_steps": ["Monitor for re-exploitation", "Patch kernel to address CVE-2026-31431"]\n'
-            f'}}\n'
-            f"```\n\n"
-            f"Set verdict based on the guidance above. Fill in real evidence from the tool findings."
-        )
-
-        phase2_messages = [
-            SystemMessage(content=REPORT_ONLY_PROMPT),
-            HumanMessage(content=report_request),
-        ]
-
-        ilog.info("phase2.start", msg="Calling LLM directly for JSON report")
-        phase2_response = await self._llm.ainvoke(phase2_messages)
-        raw = phase2_response.content if hasattr(phase2_response, "content") else str(phase2_response)
-        if isinstance(raw, list):
-            raw = "\n".join(c.get("text", "") if isinstance(c, dict) else str(c) for c in raw)
-        # Strip channel tokens
-        if "<|message|>" in raw:
-            after = raw.split("<|message|>", 1)[-1].strip()
-            raw = after if after else raw.split("<|channel|>")[0].strip()
-        ilog.info("phase2.response", length=len(raw), preview=raw[:500])
-
-        # Try to parse LLM report; if it fails, build report programmatically
-        try:
-            report_json = _extract_json(raw)
-            report = IncidentReport(**report_json)
-            report.incident_id = incident_id
-            report.host = host
-            ilog.info("incident.report", verdict=report.verdict, cves=report.cve_ids, actions=len(report.actions_taken))
-            return report
-        except Exception as e:
-            ilog.warning("phase2.parse_failed", error=str(e), msg="Building report from findings")
-
-        # Last resort: build report programmatically from tool findings
-        if copy_fail_confirmed:
-            verdict = "confirmed_threat"
-        else:
-            has_suspicious = any(
-                kw in f.lower() for f in tool_findings
-                for kw in ("algif", "splice", "esp4", "esp6", "unshare", "clone_newuser", "root shell")
-            )
-            verdict = "likely_threat" if has_suspicious else "inconclusive"
-        evidence = [f[:200] for f in tool_findings[:5]] if tool_findings else ["No tool output"]
-        report = IncidentReport(
-            incident_id=incident_id, rule=alert.rule, host=host, verdict=verdict,
-            cve_ids=["CVE-2026-31431"] if copy_fail_confirmed else [],
-            summary=f"Automated investigation completed {tool_call_count} tool calls. Manual review required.",
-            evidence=evidence,
-            actions_taken=actions_taken,
-            recommended_next_steps=["Manually review Falco alert and tool output"],
-        )
-        ilog.info("incident.report", verdict=report.verdict, source="programmatic")
-        return report
-
-
-_REPORT_REQUIRED_KEYS = {"incident_id", "rule", "host", "verdict", "summary"}
-
-
-def _extract_json(text: str) -> dict[str, Any]:
-    """
-    Extract an IncidentReport JSON object from agent text.
-
-    Tries in order:
-    1. ```json ... ``` fenced blocks (last to first)
-    2. Bare JSON object at the start of the text (model omitted fences)
-
-    Guards against template echoing (verdict contains placeholder text) and
-    against the model echoing the JSON Schema object (has 'properties'/'type'
-    instead of report fields).
-    """
-    import re
-
-    def _is_valid_report(obj):
-        """True if obj has required keys and verdict is not a placeholder."""
-        if not isinstance(obj, dict):
-            return False
-        if not _REPORT_REQUIRED_KEYS.issubset(obj.keys()):
-            return False
-        verdict = obj.get("verdict", "")
-        # Reject placeholder values like "<confirmed_threat|...>"
-        if verdict.startswith("<") or "|" in verdict:
-            return False
-        return True
-
-    # 1. Try fenced blocks first (model usually wraps in ```json ... ```)
-    blocks = re.findall(r"```(?:json)?\s*([\s\S]+?)\s*```", text, re.IGNORECASE)
-    for raw in reversed(blocks):
-        try:
-            obj = json.loads(raw)
-            if _is_valid_report(obj):
-                return obj
-        except json.JSONDecodeError:
-            continue
-
-    # 2. Try bare JSON — model returned valid JSON without fences
-    text_stripped = text.strip()
-    if text_stripped.startswith("{"):
-        try:
-            obj = json.loads(text_stripped)
-            if _is_valid_report(obj):
-                return obj
-        except json.JSONDecodeError:
-            pass
-
-    # 3. Scan for the last { ... } block that parses as valid report JSON
-    for match in reversed(list(re.finditer(r"\{[\s\S]+?\}", text))):
-        try:
-            obj = json.loads(match.group())
-            if _is_valid_report(obj):
-                return obj
-        except json.JSONDecodeError:
-            continue
-
-    raise ValueError(f"No JSON block found in agent response:\n{text[:500]}")
-
-
-def _detect_copy_fail_pattern(tool_findings: list[str], rule: str) -> bool:
-    """Return True if tool findings confirm the Copy Fail process tree fingerprint.
-
-    Copy Fail (CVE-2026-31431) uses execve() to replace a setuid binary with a
-    root shell. The resulting process tree has uid=0 shell whose parent is a
-    non-root user shell — detectable purely from get_process_info output even
-    when the model exits the graph before calling journal/network tools.
-
-    Looks for:
-    - A process running as root (uid=0 or 'root') that is a shell (sh/bash/etc.)
-    - A parent process running as a non-root user that is also a shell
-    """
-    if "Root Shell" not in rule and "copy_fail" not in rule.lower():
-        return False
-
-    combined = "\n".join(tool_findings).lower()
-
-    # Must have evidence of a root-owned shell
-    has_root_shell = (
-        ("uid=0" in combined or "user=root" in combined or " root " in combined)
-        and any(sh in combined for sh in ("name: sh", "name: bash", "comm=sh", "comm=bash", " sh\n", " bash\n"))
-    )
-
-    # Must have evidence of a non-root parent shell (cloud-user or similar)
-    has_user_parent = any(
-        user in combined for user in ("cloud-u", "cloud-user", "uid=1000", "user=cloud")
-    ) and any(sh in combined for sh in ("name: bash", "name: sh", "-bash", "ppid"))
-
-    return has_root_shell and has_user_parent
-
-
 def _strip_host_param(tool):
-    """Wrap a linux MCP tool to strip 'host' before every call.
-
-    linux-mcp-server's 'host' triggers a second SSH hop from the VM back to
-    itself (at a stale pod IP). Since we already SSH into the VM to spawn the
-    server, all tools must run locally.
-
-    We wrap at the ainvoke/invoke level (not _arun/_run) so we intercept the
-    call regardless of which code path LangChain/LangGraph takes internally.
-    The wrapper pops 'host' from the input dict and also coerces ISO 8601
-    'since' timestamps that journalctl cannot parse.
-    """
-    tool_name = tool.name  # capture for closure
+    """Wrap a linux MCP tool to drop 'host' and fix ISO 'since' timestamps."""
+    tool_name = tool.name
     original_ainvoke = tool.ainvoke
-    original_invoke = tool.invoke
+    original_invoke  = tool.invoke
 
-    def _clean_input(input_data):
-        """Pop host and coerce since; works on dict and string inputs."""
-        if isinstance(input_data, dict):
-            cleaned = {k: v for k, v in input_data.items() if k != "host"}
-            if "since" in cleaned and isinstance(cleaned.get("since"), str) and "T" in cleaned["since"]:
-                cleaned["since"] = cleaned["since"].replace("T", " ").rstrip("Z")
-            had_host = "host" in input_data
-            log.info("strip_host.call", tool=tool_name, had_host=had_host, keys=list(cleaned.keys()))
-            return cleaned
-        return input_data  # strings/other types passed through unchanged
+    def _clean(inp):
+        if not isinstance(inp, dict):
+            return inp
+        cleaned = {k: v for k, v in inp.items() if k != "host"}
+        if "since" in cleaned and isinstance(cleaned["since"], str) and "T" in cleaned["since"]:
+            cleaned["since"] = cleaned["since"].replace("T", " ").rstrip("Z")
+        return cleaned
 
-    async def _wrapped_ainvoke(input, config=None, **kwargs):
-        return await original_ainvoke(_clean_input(input), config=config, **kwargs)
+    async def _ainvoke(inp, config=None, **kw):
+        return await original_ainvoke(_clean(inp), config=config, **kw)
 
-    def _wrapped_invoke(input, config=None, **kwargs):
-        return original_invoke(_clean_input(input), config=config, **kwargs)
+    def _invoke(inp, config=None, **kw):
+        return original_invoke(_clean(inp), config=config, **kw)
 
-    # object.__setattr__ bypasses Pydantic's __setattr__ guard on model instances
-    object.__setattr__(tool, "ainvoke", _wrapped_ainvoke)
-    object.__setattr__(tool, "invoke", _wrapped_invoke)
-    log.info("strip_host.patched", tool=tool_name)
+    object.__setattr__(tool, "ainvoke", _ainvoke)
+    object.__setattr__(tool, "invoke",  _invoke)
     return tool
 
 
+# ---------------------------------------------------------------------------
+# Helper: call a single MCP tool, return string output
+# ---------------------------------------------------------------------------
+
+async def _call_tool(tool, args: dict, ilog, label: str) -> str:
+    ilog.info("tool.call", tool=tool.name, label=label, args=str(args)[:200])
+    try:
+        result = await tool.ainvoke(args)
+        text = str(result)[:4000]
+        ilog.info("tool.result", tool=tool.name, label=label, preview=text[:300])
+        return text
+    except Exception as exc:
+        ilog.error("tool.error", tool=tool.name, label=label, error=str(exc))
+        return f"ERROR: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# Node 1 — Process Inspector (pure Python, no LLM)
+# ---------------------------------------------------------------------------
+
+async def _node_process_inspect(
+    tools: dict[str, Any],
+    alert,
+    ilog,
+) -> dict[str, Any]:
+    """
+    Call get_process_info on the root shell PID from the alert, then on its
+    parent PID. Returns raw text from both calls.
+
+    No LLM involved — we deterministically call the tool with the PID
+    extracted from the Falco output_fields.
+    """
+    gpi = tools.get("get_process_info")
+    if not gpi:
+        ilog.warning("node1.missing_tool", msg="get_process_info not available")
+        return {"proc_root": "", "proc_parent": "", "root_pid": None}
+
+    # Extract PID from Falco output_fields (try several field names)
+    root_pid = (
+        alert.output_fields.get("proc.pid")
+        or alert.output_fields.get("pid")
+        or _extract_pid_from_output(alert.output)
+    )
+    ilog.info("node1.root_pid", pid=root_pid)
+
+    proc_root = ""
+    proc_parent = ""
+    ppid = None
+
+    if root_pid:
+        proc_root = await _call_tool(gpi, {"pid": str(root_pid)}, ilog, "root_shell")
+        # Extract parent PID from the result
+        ppid = _extract_ppid(proc_root)
+        ilog.info("node1.ppid", ppid=ppid)
+
+    if ppid:
+        proc_parent = await _call_tool(gpi, {"pid": str(ppid)}, ilog, "parent_shell")
+    else:
+        # Falco fired "Root Shell Spawned Directly by User Shell" — the alert
+        # output already contains parent info; we don't need a second call if
+        # the parent PID can't be extracted from proc output.
+        ilog.info("node1.no_ppid", msg="Could not extract PPID from proc_root; relying on alert output")
+
+    return {
+        "proc_root":   proc_root,
+        "proc_parent": proc_parent,
+        "root_pid":    root_pid,
+        "ppid":        ppid,
+    }
+
+
+def _extract_pid_from_output(output: str) -> Optional[str]:
+    """Pull PID from Falco output string like '... pid=2538 ...'"""
+    m = re.search(r"\bpid=(\d+)", output)
+    return m.group(1) if m else None
+
+
+def _extract_ppid(proc_text: str) -> Optional[str]:
+    """Pull PPID from get_process_info output."""
+    for pattern in (r"ppid[=:\s]+(\d+)", r"parent.*?pid[=:\s]+(\d+)", r"PPID[=:\s]+(\d+)"):
+        m = re.search(pattern, proc_text, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Node 2 — Host Triage (pure Python, no LLM)
+# ---------------------------------------------------------------------------
+
+async def _node_host_triage(
+    tools: dict[str, Any],
+    ilog,
+) -> dict[str, Any]:
+    """
+    Call get_journal_logs (last 15 min) and get_network_connections.
+    Pure Python — no model involvement.
+    """
+    gjl = tools.get("get_journal_logs")
+    gnc = tools.get("get_network_connections")
+
+    journal = ""
+    network = ""
+
+    if gjl:
+        journal = await _call_tool(gjl, {"since": "-15m"}, ilog, "journal_triage")
+    else:
+        ilog.warning("node2.missing_tool", msg="get_journal_logs not available")
+
+    if gnc:
+        network = await _call_tool(gnc, {}, ilog, "network_triage")
+    else:
+        ilog.warning("node2.missing_tool", msg="get_network_connections not available")
+
+    return {"journal": journal, "network": network}
+
+
+# ---------------------------------------------------------------------------
+# Node 3 — Threat Classifier (LLM only, structured output)
+# ---------------------------------------------------------------------------
+
+CLASSIFY_SYSTEM = """\
+You are a Linux security analyst. You will receive evidence from a RHEL host that
+triggered a Falco "Root Shell Spawned Directly by User Shell" alert.
+
+Your ONLY job is to classify the incident using the evidence.
+Do NOT suggest additional tool calls. Do NOT write a report.
+Output ONLY the structured classification — nothing else.
+
+CVE reference patterns:
+- CVE-2026-31431 (Copy Fail): AF_ALG socket + splice() corrupts page cache of a setuid
+  binary via execve() replacement. Post-exploitation fingerprint: root shell (uid=0) whose
+  DIRECT parent is a non-root user shell (bash/sh running as uid=1000). The parent is NOT
+  su or sudo — it is the attacker's interactive session shell.
+- CVE-2026-46300 (Fragnesia): user namespace + XFRM ESP page cache corruption. Similar
+  post-exploitation fingerprint, but preceded by unshare(CLONE_NEWUSER) in journal.
+
+EXAMPLE:
+Evidence:
+  [proc_root]  PID 2538  uid=0   comm=sh   PPID=2480
+  [proc_parent] PID 2480 uid=1000 comm=bash user=cloud-user
+  [journal]    splice, algif socket operations visible around alert time
+  [network]    no unexpected outbound connections
+
+Classification:
+  verdict: confirmed_threat
+  cve_ids: ["CVE-2026-31431"]
+  confidence_notes: Root shell uid=0 (sh) with direct parent uid=1000 (bash/cloud-user).
+    Matches execve() replacement pattern of Copy Fail. Journal confirms splice+algif activity.
+"""
+
+
+async def _node_classify(
+    llm,
+    alert,
+    proc_root: str,
+    proc_parent: str,
+    journal: str,
+    network: str,
+    ilog,
+) -> ClassifyResult:
+    """
+    Ask the LLM to classify the threat.
+
+    Strategy (most-to-least reliable):
+    1. with_structured_output (function-calling / JSON schema mode) — best for
+       models that support tool calling.
+    2. Plain LLM call → parse JSON from response — fallback for models that
+       don't support structured output but can emit JSON in chat mode.
+    3. Rule-based classify — if LLM is unavailable or produces garbage.
+    """
+    verdict_hint = (
+        "The Falco rule that fired ('Root Shell Spawned Directly by User Shell') "
+        "is specifically designed to detect this pattern."
+        if "Root Shell Spawned Directly by User Shell" in alert.rule else ""
+    )
+
+    evidence_block = (
+        f"FALCO ALERT:\n"
+        f"  rule:   {alert.rule}\n"
+        f"  output: {alert.output}\n"
+        f"  fields: {json.dumps(alert.output_fields)}\n\n"
+        f"[proc_root (root shell)]:\n{proc_root or '(not retrieved)'}\n\n"
+        f"[proc_parent (parent of root shell)]:\n{proc_parent or '(not retrieved)'}\n\n"
+        f"[journal (last 15 min)]:\n{journal[:2000] or '(not retrieved)'}\n\n"
+        f"[network connections]:\n{network[:1000] or '(not retrieved)'}\n"
+        + (f"\nHINT: {verdict_hint}" if verdict_hint else "")
+    )
+
+    messages = [
+        SystemMessage(content=CLASSIFY_SYSTEM),
+        HumanMessage(content=evidence_block),
+    ]
+
+    ilog.info("node3.classify_start")
+
+    # Attempt 1: structured output (function-calling)
+    try:
+        classify_llm = llm.with_structured_output(ClassifyResult)
+        result: ClassifyResult = await classify_llm.ainvoke(messages)
+        ilog.info("node3.classify_done", method="structured_output",
+                  verdict=result.verdict, cves=result.cve_ids,
+                  notes=result.confidence_notes[:120])
+        return result
+    except Exception as exc:
+        ilog.warning("node3.structured_output_failed", error=str(exc),
+                     msg="Falling back to JSON-from-chat")
+
+    # Attempt 2: plain chat call, parse JSON from response
+    # Ask the model to emit JSON matching the ClassifyResult schema
+    JSON_SUFFIX = (
+        "\n\nRespond with ONLY a JSON object matching this schema (no preamble):\n"
+        '{"verdict": "confirmed_threat|likely_threat|false_positive|inconclusive", '
+        '"cve_ids": ["CVE-..."], "confidence_notes": "..."}'
+    )
+    try:
+        raw_response = await llm.ainvoke([
+            SystemMessage(content=CLASSIFY_SYSTEM),
+            HumanMessage(content=evidence_block + JSON_SUFFIX),
+        ])
+        raw = raw_response.content if hasattr(raw_response, "content") else str(raw_response)
+        if isinstance(raw, list):
+            raw = "\n".join(c.get("text", "") if isinstance(c, dict) else str(c) for c in raw)
+        if "<|message|>" in raw:
+            raw = raw.split("<|message|>", 1)[-1].strip()
+        # Parse the JSON
+        m = re.search(r"\{[\s\S]+\}", raw)
+        if m:
+            obj = json.loads(m.group())
+            result = ClassifyResult(**obj)
+            ilog.info("node3.classify_done", method="json_from_chat",
+                      verdict=result.verdict, cves=result.cve_ids)
+            return result
+    except Exception as exc:
+        ilog.warning("node3.json_parse_failed", error=str(exc),
+                     msg="Falling back to rule-based classification")
+
+    raise RuntimeError("All LLM classify strategies failed")
+
+
+# ---------------------------------------------------------------------------
+# Node 4 — AAP Remediation (pure Python, deterministic dispatch)
+# ---------------------------------------------------------------------------
+
+async def _node_remediate(
+    aap_tools: dict[str, Any],
+    verdict: str,
+    root_pid,
+    ilog,
+) -> list[str]:
+    """
+    If verdict warrants remediation, deterministically launch the three
+    pre-approved AAP playbooks. No LLM involved.
+
+    Playbooks:
+      drop_page_cache (id=10) — purges corrupted page cache entries
+      kill_session    (id=8)  — terminates the root shell process
+      lock_user       (id=11) — writes audit log (non-destructive for demo)
+    """
+    if verdict not in ("confirmed_threat", "likely_threat"):
+        ilog.info("node4.skip", verdict=verdict, msg="No remediation needed")
+        return []
+
+    launch_tool   = aap_tools.get("job_templates_launch_create")
+    retrieve_tool = aap_tools.get("jobs_retrieve")
+
+    if not launch_tool or not retrieve_tool:
+        ilog.warning("node4.missing_tools", msg="AAP tools not available")
+        return []
+
+    playbooks = [
+        ("drop_page_cache", AAP_TEMPLATE_IDS["drop_page_cache"],
+         json.dumps({"target_host": AAP_TARGET_HOST})),
+        ("kill_session", AAP_TEMPLATE_IDS["kill_session"],
+         json.dumps({"target_pid": str(root_pid) if root_pid else "0",
+                     "target_host": AAP_TARGET_HOST})),
+        ("lock_user", AAP_TEMPLATE_IDS["lock_user"],
+         json.dumps({"compromised_user": "cloud-user",
+                     "target_host": AAP_TARGET_HOST})),
+    ]
+
+    actions: list[str] = []
+    for name, template_id, extra_vars in playbooks:
+        try:
+            ilog.info("node4.launch", playbook=name, template_id=template_id)
+            launch_result = await launch_tool.ainvoke(
+                {"id": str(template_id), "extra_vars": extra_vars}
+            )
+            result_text = str(launch_result)
+
+            job_id = None
+            m = re.search(r'"id":\s*(\d+)', result_text)
+            if m:
+                job_id = m.group(1)
+
+            if job_id:
+                ilog.info("node4.launched", playbook=name, job_id=job_id)
+                retrieve_result = await retrieve_tool.ainvoke({"id": job_id})
+                ilog.info("node4.retrieved", playbook=name, job_id=job_id,
+                          preview=str(retrieve_result)[:200])
+                actions.append(f"{name} (job_id={job_id})")
+            else:
+                ilog.warning("node4.no_job_id", playbook=name, result=result_text[:300])
+                actions.append(f"{name} (launched, no job_id in response)")
+        except Exception as exc:
+            ilog.error("node4.launch_failed", playbook=name, error=str(exc))
+
+    return actions
+
+
+# ---------------------------------------------------------------------------
+# Node 5 — Report Writer (LLM: plain text summary only)
+# ---------------------------------------------------------------------------
+
+REPORT_SYSTEM = """\
+You are a security analyst writing the summary section of an incident report.
+Write exactly ONE paragraph (4-6 sentences) summarizing what happened, what was
+confirmed, and what remediation was taken. Be specific — reference the process names,
+PIDs, CVE ID, and playbook names from the evidence. Do not use bullet points.
+Do not write JSON. Do not write headers. Just the paragraph.
+"""
+
+
+async def _node_report(
+    llm,
+    alert,
+    host: str,
+    proc_root: str,
+    proc_parent: str,
+    journal: str,
+    network: str,
+    classify: ClassifyResult,
+    actions_taken: list[str],
+    ilog,
+) -> str:
+    """Ask the LLM to write a one-paragraph plain-text summary."""
+    evidence_block = (
+        f"Alert rule: {alert.rule}\n"
+        f"Host: {host}\n"
+        f"Verdict: {classify.verdict}\n"
+        f"CVEs: {', '.join(classify.cve_ids) or 'none identified'}\n"
+        f"Classifier notes: {classify.confidence_notes}\n\n"
+        f"Process findings (root shell): {proc_root[:600] or '(none)'}\n"
+        f"Process findings (parent): {proc_parent[:400] or '(none)'}\n"
+        f"Journal excerpt: {journal[:600] or '(none)'}\n"
+        f"Network excerpt: {network[:300] or '(none)'}\n"
+        f"Remediation actions taken: {', '.join(actions_taken) or 'none'}\n"
+    )
+
+    ilog.info("node5.report_start")
+    response = await llm.ainvoke([
+        SystemMessage(content=REPORT_SYSTEM),
+        HumanMessage(content=evidence_block),
+    ])
+    content = response.content if hasattr(response, "content") else str(response)
+    if isinstance(content, list):
+        content = "\n".join(c.get("text", "") if isinstance(c, dict) else str(c) for c in content)
+    # Strip model channel tokens
+    if "<|message|>" in content:
+        after = content.split("<|message|>", 1)[-1].strip()
+        content = after if after else content.split("<|channel|>")[0].strip()
+    content = str(content).strip()
+    ilog.info("node5.report_done", length=len(content), preview=content[:200])
+    return content
+
+
+# ---------------------------------------------------------------------------
+# Main agent class
+# ---------------------------------------------------------------------------
+
+class ThreatResponseAgent:
+    def __init__(
+        self,
+        linux_tools: dict[str, Any],
+        aap_tools: dict[str, Any],
+        llm,
+    ):
+        self._linux_tools = linux_tools
+        self._aap_tools   = aap_tools
+        self._llm         = llm
+
+    async def ainvoke(self, alert, incident_id: str) -> IncidentReport:
+        host = (
+            alert.output_fields.get("container.name")
+            or alert.hostname
+            or AAP_TARGET_HOST
+        )
+        ilog = log.bind(incident_id=incident_id, host=host, rule=alert.rule)
+        ilog.info("agent.start")
+
+        # ── Node 1: inspect root shell + parent process ──────────────────────
+        ilog.info("pipeline.node1", step="process_inspect")
+        n1 = await _node_process_inspect(self._linux_tools, alert, ilog)
+        proc_root   = n1["proc_root"]
+        proc_parent = n1["proc_parent"]
+        root_pid    = n1["root_pid"]
+
+        # ── Node 2: journal + network triage ─────────────────────────────────
+        ilog.info("pipeline.node2", step="host_triage")
+        n2 = await _node_host_triage(self._linux_tools, ilog)
+        journal = n2["journal"]
+        network = n2["network"]
+
+        # ── Node 3: LLM classifier (structured output) ───────────────────────
+        ilog.info("pipeline.node3", step="classify")
+        try:
+            classify = await _node_classify(
+                self._llm, alert,
+                proc_root, proc_parent, journal, network,
+                ilog,
+            )
+        except Exception as exc:
+            ilog.error("node3.classify_failed", error=str(exc))
+            # Fall back to rule-based classification if LLM fails
+            classify = _rule_based_classify(alert, proc_root, proc_parent)
+            ilog.info("node3.classify_fallback", verdict=classify.verdict)
+
+        # ── Node 4: deterministic AAP remediation ────────────────────────────
+        ilog.info("pipeline.node4", step="remediate", verdict=classify.verdict)
+        actions_taken = await _node_remediate(
+            self._aap_tools, classify.verdict, root_pid, ilog
+        )
+
+        # ── Node 5: LLM summary paragraph ────────────────────────────────────
+        ilog.info("pipeline.node5", step="report")
+        try:
+            summary = await _node_report(
+                self._llm, alert, host,
+                proc_root, proc_parent, journal, network,
+                classify, actions_taken,
+                ilog,
+            )
+        except Exception as exc:
+            ilog.error("node5.report_failed", error=str(exc))
+            summary = (
+                f"Automated investigation confirmed {classify.verdict} "
+                f"({', '.join(classify.cve_ids) or 'unknown CVE'}). "
+                f"Remediation actions: {', '.join(actions_taken) or 'none'}."
+            )
+
+        # ── Assemble final report (pure Python) ──────────────────────────────
+        evidence = _build_evidence(alert, proc_root, proc_parent, journal, network)
+        next_steps = _recommended_next_steps(classify.verdict, classify.cve_ids)
+
+        report = IncidentReport(
+            incident_id=incident_id,
+            rule=alert.rule,
+            host=host,
+            verdict=classify.verdict,
+            cve_ids=classify.cve_ids,
+            summary=summary,
+            evidence=evidence,
+            actions_taken=actions_taken,
+            recommended_next_steps=next_steps,
+        )
+        ilog.info(
+            "incident.report",
+            verdict=report.verdict,
+            cves=report.cve_ids,
+            actions=len(report.actions_taken),
+        )
+        return report
+
+
+# ---------------------------------------------------------------------------
+# Pure-Python helpers for classification fallback, evidence, next steps
+# ---------------------------------------------------------------------------
+
+def _rule_based_classify(alert, proc_root: str, proc_parent: str) -> ClassifyResult:
+    """Deterministic fallback if the LLM classifier fails."""
+    combined = (proc_root + proc_parent + alert.output).lower()
+    is_root_shell = "uid=0" in combined or "user=root" in combined
+    has_user_parent = any(u in combined for u in ("uid=1000", "cloud-user", "cloud-u"))
+    copy_fail_tags = "copy_fail" in " ".join(alert.tags).lower()
+
+    if is_root_shell and has_user_parent and "Root Shell" in alert.rule:
+        return ClassifyResult(
+            verdict="confirmed_threat",
+            cve_ids=["CVE-2026-31431"],
+            confidence_notes="Rule-based: root shell (uid=0) with non-root parent matches Copy Fail fingerprint.",
+        )
+    if copy_fail_tags or is_root_shell:
+        return ClassifyResult(
+            verdict="likely_threat",
+            cve_ids=["CVE-2026-31431"] if copy_fail_tags else [],
+            confidence_notes="Rule-based: suspicious signals present but parent process not confirmed.",
+        )
+    return ClassifyResult(
+        verdict="inconclusive",
+        cve_ids=[],
+        confidence_notes="Rule-based: insufficient evidence for classification.",
+    )
+
+
+def _build_evidence(alert, proc_root: str, proc_parent: str, journal: str, network: str) -> list[str]:
+    items: list[str] = []
+    if alert.output:
+        items.append(f"Falco: {alert.output[:300]}")
+    if proc_root:
+        items.append(f"Root shell process: {proc_root[:300]}")
+    if proc_parent:
+        items.append(f"Parent process: {proc_parent[:300]}")
+    if journal and "algif" in journal.lower():
+        items.append("Journal: AF_ALG (algif) socket activity detected near alert time")
+    elif journal:
+        items.append(f"Journal: {journal[:200]}")
+    if network and network.strip() and "ERROR" not in network:
+        items.append(f"Network: {network[:200]}")
+    return items or ["No tool output captured"]
+
+
+def _recommended_next_steps(verdict: str, cve_ids: list[str]) -> list[str]:
+    steps = []
+    if "CVE-2026-31431" in cve_ids:
+        steps.append("Apply kernel patch for CVE-2026-31431 (Copy Fail page cache corruption)")
+    if verdict in ("confirmed_threat", "likely_threat"):
+        steps.extend([
+            "Review /var/log/security-incidents/ for the audit record written by lock_user playbook",
+            "Rotate SSH keys and credentials for cloud-user",
+            "Monitor host for re-exploitation attempts",
+            "File incident ticket with forensic artifacts",
+        ])
+    else:
+        steps.append("Monitor host — alert may be a false positive")
+    return steps
+
+
+# ---------------------------------------------------------------------------
+# Agent factory (called once at startup)
+# ---------------------------------------------------------------------------
+
 async def build_agent() -> ThreatResponseAgent:
-    """
-    Build the LangGraph ReAct agent with MCP tools loaded at startup.
-    Call once during app lifespan; reuse the returned agent for all requests.
-    """
     log.info("agent.build", model=AGENT_MODEL)
 
     mcp_client = MultiServerMCPClient(
         {
             "linux": {
-                # linux-mcp-server uses stdio transport; we reach the RHEL VM over SSH.
-                # The client SSHs in and spawns the process, piping stdio through the tunnel.
                 "transport": "stdio",
                 "command": "ssh",
                 "args": [
@@ -638,8 +705,6 @@ async def build_agent() -> ThreatResponseAgent:
                 ],
             },
             "aap": {
-                # AAP MCP server uses streamable-HTTP transport (MCP spec 2024-11-05):
-                # POST with Accept: application/json, text/event-stream
                 "url": AAP_MCP_URL,
                 "transport": "streamable_http",
                 "headers": {"Authorization": f"Bearer {AAP_TOKEN}"} if AAP_TOKEN else {},
@@ -647,50 +712,21 @@ async def build_agent() -> ThreatResponseAgent:
         }
     )
 
-    # Load tools from both MCP servers, then filter to only what the agent needs.
-    # Exposing all 120+ AAP tools causes model confusion; a tight allowlist keeps
-    # the tool-selection problem tractable.
-    LINUX_TOOLS = {
-        "get_process_info",
-        "get_journal_logs",
-        "get_network_connections",
-        "get_file_info",
-        "run_command",
-    }
-    AAP_TOOLS = {
-        "job_templates_list",
-        "job_templates_launch_create",
-        "jobs_retrieve",
-        "jobs_stdout_retrieve",
-    }
-    ALLOWED_TOOLS = LINUX_TOOLS | AAP_TOOLS
-
     all_tools = await mcp_client.get_tools()
-    tools = [t for t in all_tools if t.name in ALLOWED_TOOLS]
-    skipped = [t.name for t in all_tools if t.name not in ALLOWED_TOOLS]
 
-    # Strip the "host" parameter from all linux tools.
-    # linux-mcp-server's remote-execution flag is controlled by the server itself;
-    # exposing "host" to the model causes it to attempt a second SSH hop from the VM
-    # back to itself using a potentially stale IP, which always fails.
-    tools = [_strip_host_param(t) if t.name in LINUX_TOOLS else t for t in tools]
+    linux_raw = {t.name: t for t in all_tools if t.name in LINUX_TOOLS}
+    aap_raw   = {t.name: t for t in all_tools if t.name in AAP_TOOLS}
+
+    # Strip host param from every linux tool
+    linux_tools = {name: _strip_host_param(t) for name, t in linux_raw.items()}
+    aap_tools   = dict(aap_raw)
 
     log.info(
         "agent.tools_loaded",
-        count=len(tools),
-        names=[t.name for t in tools],
-        skipped_count=len(skipped),
+        linux=list(linux_tools.keys()),
+        aap=list(aap_tools.keys()),
     )
 
     llm = _build_llm()
 
-    graph = create_react_agent(
-        model=llm,
-        tools=tools,
-        # Checkpoint not needed for stateless webhook processing
-    )
-
-    # Keep a direct reference to AAP tools for programmatic fallback remediation
-    aap_tools = {t.name: t for t in tools if t.name in AAP_TOOLS}
-
-    return ThreatResponseAgent(graph, mcp_client, llm, aap_tools)
+    return ThreatResponseAgent(linux_tools, aap_tools, llm)
