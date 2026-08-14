@@ -1,0 +1,278 @@
+---
+# Install and configure Falco on a RHEL 9 host for the autonomous-threat-response demo.
+#
+# Usage:
+#   ansible-playbook -i <ip>, playbooks/setup_falco.yml \
+#     -e agent_webhook_url=http://<agent-route>/webhook \
+#     --private-key ~/.ssh/id_rsa -u cloud-user
+#
+# Variables:
+#   agent_webhook_url   (required) Full URL of the threat-response agent webhook,
+#                       e.g. http://threat-response-agent-rhn-sa-dev.apps.example.com/webhook
+#   falco_version       (optional) Falco package version, default: latest available
+#   bpf_jit_enable      (optional) Enable eBPF JIT compiler, default: true
+
+- name: Install and configure Falco with modern eBPF on RHEL 9
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    bpf_jit_enable: true
+    falco_rules_dir: /etc/falco/rules.d
+
+  pre_tasks:
+    - name: Verify target is RHEL 9
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "RedHat"
+          - ansible_distribution_major_version == "9"
+        fail_msg: "This playbook targets RHEL 9. Found: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+    - name: Verify agent_webhook_url is set
+      ansible.builtin.assert:
+        that: agent_webhook_url is defined and agent_webhook_url | length > 0
+        fail_msg: "Required variable 'agent_webhook_url' is not set. Pass -e agent_webhook_url=http://<host>/webhook"
+
+  tasks:
+    # ── Falco installation ──────────────────────────────────────────────────
+
+    - name: Import Falcosecurity GPG key
+      ansible.builtin.rpm_key:
+        key: https://falco.org/repo/falcosecurity-packages.asc
+        state: present
+
+    - name: Add Falcosecurity RPM repository
+      ansible.builtin.get_url:
+        url: https://falco.org/repo/falcosecurity-rpm.repo
+        dest: /etc/yum.repos.d/falcosecurity.repo
+        mode: '0644'
+
+    - name: Install Falco
+      ansible.builtin.dnf:
+        name: falco
+        state: present
+
+    # ── eBPF JIT (optional performance tuning) ──────────────────────────────
+
+    - name: Enable eBPF JIT compiler at runtime
+      ansible.posix.sysctl:
+        name: net.core.bpf_jit_enable
+        value: "1"
+        state: present
+        sysctl_set: true
+        reload: true
+      when: bpf_jit_enable | bool
+
+    # ── Falco main configuration ────────────────────────────────────────────
+
+    - name: Write /etc/falco/falco.yaml
+      ansible.builtin.copy:
+        dest: /etc/falco/falco.yaml
+        mode: '0640'
+        owner: root
+        group: root
+        content: |
+          # Falco configuration for autonomous-threat-response demo
+          # Driver: modern eBPF (no kernel headers or module compilation required)
+
+          engine:
+            kind: modern_ebpf
+
+          # Emit structured JSON — required for the agent webhook to parse alerts
+          json_output: true
+          json_include_output_property: true
+          json_include_tags_property: true
+
+          # Reload rules automatically when files change
+          watch_config_files: true
+
+          # HTTP output: POST alerts to the threat-response agent webhook
+          http_output:
+            enabled: true
+            url: "{{ agent_webhook_url }}"
+            user_agent: "falcowebhook"
+            keep_alive: false
+
+          # Standard outputs (kept for local visibility)
+          stdout_output:
+            enabled: true
+
+          syslog_output:
+            enabled: true
+
+          # Rules
+          rules_files:
+            - /etc/falco/falco_rules.yaml
+            - /etc/falco/falco_rules.local.yaml
+            - /etc/falco/rules.d
+
+    # ── Custom detection rules ───────────────────────────────────────────────
+
+    - name: Ensure rules.d directory exists
+      ansible.builtin.file:
+        path: "{{ falco_rules_dir }}"
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Deploy Copy Fail (CVE-2026-31431) detection rules
+      ansible.builtin.copy:
+        dest: "{{ falco_rules_dir }}/copy_fail.yaml"
+        mode: '0644'
+        owner: root
+        group: root
+        content: |
+          - rule: Copy Fail AF_ALG Socket Created by Unprivileged Process
+            desc: >
+              Detects creation of a socket by a non-root host process as an early
+              indicator of CVE-2026-31431 (Copy Fail). Disabled by default — too broad.
+            condition: >
+              evt.type = socket and
+              not container and
+              not user.uid = 0
+            output: >
+              socket() called by unprivileged host process — possible Copy Fail early indicator
+              (user=%user.name uid=%user.uid pid=%proc.pid
+               comm=%proc.name parent=%proc.pname cmdline=%proc.cmdline
+               container=%container.name)
+            priority: WARNING
+            enabled: false
+            tags: [CVE-2026-31431, copy_fail, lpe, page_cache]
+
+          - rule: Copy Fail Splice into AF_ALG Socket
+            desc: >
+              Detects splice() from an unprivileged host process where the fd name
+              contains "algif" — the core exploitation primitive of CVE-2026-31431.
+            condition: >
+              evt.type = splice and
+              not container and
+              not user.uid = 0 and
+              fd.name contains "algif"
+            output: >
+              splice() into AF_ALG socket by unprivileged host process — possible Copy Fail exploit
+              (user=%user.name uid=%user.uid pid=%proc.pid
+               comm=%proc.name parent=%proc.pname cmdline=%proc.cmdline
+               container=%container.name)
+            priority: ERROR
+            tags: [CVE-2026-31431, copy_fail, lpe, page_cache]
+
+          - rule: Root Shell Spawned Directly by User Shell
+            desc: >
+              Detects a root shell (uid=0) whose direct parent is a user-level interactive
+              shell. Legitimate su/sudo never produce this parent relationship. In Copy Fail
+              (CVE-2026-31431) and Fragnesia (CVE-2026-46300) the corrupted setuid binary
+              calls execve() to replace itself with a shell, so the root shell's parent is
+              the attacker's original session — not su. This is the reliable post-exploitation
+              fingerprint for both CVEs.
+            condition: >
+              spawned_process and
+              not container and
+              user.uid = 0 and
+              proc.name in (bash, sh, dash, zsh, ksh, ksh93, tcsh, csh, fish, rbash, rzsh) and
+              proc.pname in (bash, sh, dash, zsh, ksh, ksh93, tcsh, csh, fish, rbash, rzsh)
+            output: >
+              Root shell spawned directly by user shell — possible LPE via page cache corruption
+              (user=%user.name uid=%user.uid pid=%proc.pid ppid=%proc.ppid
+               comm=%proc.name parent=%proc.pname cmdline=%proc.cmdline
+               pcmdline=%proc.pcmdline container=%container.name)
+            priority: CRITICAL
+            tags: [CVE-2026-31431, CVE-2026-46300, copy_fail, fragnesia, lpe, page_cache]
+
+    - name: Deploy Fragnesia (CVE-2026-46300) detection rules
+      ansible.builtin.copy:
+        dest: "{{ falco_rules_dir }}/fragnesia.yaml"
+        mode: '0644'
+        owner: root
+        group: root
+        content: |
+          - rule: Fragnesia User Namespace Creation by Unprivileged Process
+            desc: >
+              Detects unshare/clone with CLONE_NEWUSER by a non-root host process.
+              CVE-2026-46300 uses user namespaces to gain CAP_NET_ADMIN.
+            condition: >
+              evt.type in (unshare, clone) and
+              not container and
+              not user.uid = 0 and
+              evt.arg.flags contains CLONE_NEWUSER
+            output: >
+              User namespace created by unprivileged host process — possible Fragnesia exploit setup
+              (user=%user.name uid=%user.uid pid=%proc.pid
+               comm=%proc.name parent=%proc.pname cmdline=%proc.cmdline
+               container=%container.name)
+            priority: WARNING
+            tags: [CVE-2026-46300, fragnesia, lpe, namespace, page_cache]
+
+          - rule: Fragnesia ESP Module Loaded or Used by Unprivileged Process
+            desc: >
+              Detects loading of esp4/esp6 modules by a non-root host process.
+              Fragnesia requires the XFRM ESP subsystem to trigger page cache corruption.
+            condition: >
+              evt.type in (init_module, finit_module) and
+              not container and
+              not user.uid = 0 and
+              (evt.arg.uargs contains "esp4" or evt.arg.uargs contains "esp6")
+            output: >
+              ESP kernel module loaded by unprivileged host process — possible Fragnesia exploit
+              (user=%user.name uid=%user.uid pid=%proc.pid
+               comm=%proc.name parent=%proc.pname cmdline=%proc.cmdline
+               container=%container.name)
+            priority: ERROR
+            tags: [CVE-2026-46300, fragnesia, lpe, kernel_module, page_cache]
+
+          - rule: Fragnesia GRO UDP Splice Pattern
+            desc: >
+              Detects large UDP datagrams from a non-root host process (GRO variant of
+              Fragnesia). Heuristic — tune the size threshold for your environment.
+            condition: >
+              evt.type = sendmsg and
+              not container and
+              not user.uid = 0 and
+              fd.type = socket and
+              fd.l4proto = udp and
+              evt.arg.size > 65000
+            output: >
+              Large UDP sendmsg by unprivileged host process — possible Fragnesia GRO variant
+              (user=%user.name uid=%user.uid pid=%proc.pid
+               comm=%proc.name parent=%proc.pname cmdline=%proc.cmdline
+               size=%evt.arg.size container=%container.name)
+            priority: WARNING
+            tags: [CVE-2026-46300, fragnesia, lpe, gro, page_cache]
+
+    # ── Service ─────────────────────────────────────────────────────────────
+
+    - name: Enable and start falco-modern-bpf service
+      ansible.builtin.systemd:
+        name: falco-modern-bpf
+        enabled: true
+        state: restarted
+        daemon_reload: true
+
+    - name: Wait for Falco to be active
+      ansible.builtin.command:
+        cmd: systemctl is-active falco-modern-bpf
+      register: falco_active
+      retries: 6
+      delay: 5
+      until: falco_active.stdout == "active"
+      changed_when: false
+
+    # ── Smoke test ──────────────────────────────────────────────────────────
+
+    - name: Confirm Falco loaded our custom rules
+      ansible.builtin.shell:
+        cmd: journalctl -u falco-modern-bpf --since "-30s" --no-pager | grep -c "Loading rules"
+      register: rules_loaded
+      changed_when: false
+      failed_when: false
+
+    - name: Report setup result
+      ansible.builtin.debug:
+        msg:
+          - "Falco installed and running with modern eBPF driver"
+          - "Custom rules deployed to {{ falco_rules_dir }}"
+          - "HTTP webhook configured: {{ agent_webhook_url }}"
+          - "JSON output: enabled"
+          - "Service status: active"
+          - "To verify: journalctl -u falco-modern-bpf -f"
