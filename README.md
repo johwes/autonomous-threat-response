@@ -1,110 +1,164 @@
 # autonomous-threat-response
 
-> **WIP** — Work in progress. Demo design and implementation in progress.
+An autonomous defensive AI agent that detects and responds to active Linux privilege escalation attacks in real time — without human intervention.
 
-An autonomous defensive AI agent that detects and responds to active attacks on a RHEL host in real time.
+The demo uses two recent kernel local privilege escalation (LPE) vulnerabilities as the attack scenario:
 
-## Overview
+- **Copy Fail (CVE-2026-31431)** — Logic flaw in the `AF_ALG` cryptographic interface allowing unprivileged page cache writes to gain root via splice + execve replacement of a setuid binary.
+- **Fragnesia (CVE-2026-46300)** — ESP-in-TCP XFRM subsystem flaw causing in-place AES-GCM decryption over page-cache-backed frags, yielding root via the same setuid corruption pattern.
 
-This project demonstrates an agentic security operations workflow triggered by real CVEs. When an attack is detected, a Claude AI agent investigates the threat using live system telemetry and triggers remediation via Ansible Automation Platform — without human intervention.
-
-The demo uses two recent Linux local privilege escalation (LPE) vulnerabilities as the attack scenario:
-
-- **Copy Fail (CVE-2026-31431)** — Logic flaw in the Linux kernel `AF_ALG` cryptographic interface allowing unprivileged page cache writes to gain root
-- **Fragnesia (CVE-2026-46300)** — ESP-in-TCP XFRM subsystem flaw causing in-place AES-GCM decryption over page-cache-backed frags, yielding root via setuid binary corruption
-
-Both attacks corrupt setuid binaries (e.g. `/usr/bin/su`) in the page cache without touching the on-disk file — bypassing traditional file integrity monitoring. Only behavioral/runtime detection catches them.
+Both attacks corrupt setuid binaries (e.g. `/usr/bin/su`) in the page cache **without touching the on-disk file** — bypassing file integrity monitoring, antivirus, and `rpm -V`. Only behavioral/runtime detection catches them.
 
 ## Architecture
 
 ```
 Attacker (low-priv user on RHEL host)
          │
-         │  runs exploit (Copy Fail or Fragnesia PoC)
+         │  runs exploit.py (Copy Fail PoC)
          ▼
-┌─────────────────────────────┐
-│         RHEL Host           │
-│                             │
-│  Falco (runtime detection)  │
-│    - AF_ALG + splice rule   │
-│    - CLONE_NEWUSER rule     │
-│    - setuid shell spawn     │
-└────────────┬────────────────┘
-             │ webhook (alert + context)
-             ▼
-┌─────────────────────────────┐
-│       Claude AI Agent       │
-│                             │
-│  Receives Falco alert       │
-│  Investigates via MCP:      │
-│    - get_audit_logs         │
-│    - get_process_info       │
-│    - get_network_connections│
-│  Reasons about threat       │
-│  Decides on response        │
-└────────────┬────────────────┘
-             │ trigger job template
-             ▼
-┌─────────────────────────────┐
-│  Ansible Automation Platform│
-│       + MCP Server          │
-│                             │
-│  Runs remediation playbook: │
-│    - Kill root shell process│
-│    - Blacklist kernel module│
-│    - Drop page cache        │
-│    - Lock compromised user  │
-└────────────┬────────────────┘
-             │ SSH
-             ▼
-┌─────────────────────────────┐
-│         RHEL Host           │
-│      (remediated)           │
-└─────────────────────────────┘
+┌──────────────────────────────────────────┐
+│               RHEL Host (KubeVirt VM)    │
+│                                          │
+│  Falco 0.44.1 (modern eBPF driver)       │
+│    - Copy Fail Splice into AF_ALG Socket │
+│    - Root Shell Spawned by User Shell    │  ← CRITICAL alert
+└──────────────────────┬───────────────────┘
+                       │ HTTP webhook (JSON)
+                       ▼
+┌──────────────────────────────────────────┐
+│         Threat Response Agent            │
+│         (FastAPI + LangGraph)            │
+│                                          │
+│  Node 1: process_inspect  (pure Python)  │
+│    get_process_info(root_pid)            │
+│    get_process_info(parent_pid)          │
+│                                          │
+│  Node 2: host_triage      (pure Python)  │
+│    get_journal_logs(since="-15m")        │
+│    get_network_connections()             │
+│                                          │
+│  Node 3: classify         (LLM only)     │
+│    structured output → verdict + CVE     │
+│                                          │
+│  Node 4: remediate        (pure Python)  │
+│    AAP: drop_page_cache  (job_id=10)     │
+│    AAP: kill_session     (job_id=8)      │
+│    AAP: lock_user        (job_id=11)     │
+│                                          │
+│  Node 5: report           (LLM only)     │
+│    plain-text summary paragraph          │
+│    → IncidentReport JSON (assembled      │
+│      in Python, not by the LLM)          │
+└──────────────────────┬───────────────────┘
+                       │ AAP MCP (streamable-HTTP)
+                       ▼
+┌──────────────────────────────────────────┐
+│  Ansible Automation Platform 2.6         │
+│  + AAP MCP Server                        │
+│                                          │
+│  Playbooks run against rhel9-brown-loon  │
+│  via stable K8s Service DNS              │
+└──────────────────────────────────────────┘
 ```
+
+## Why a deterministic pipeline instead of a ReAct agent
+
+The agent runs on a small model (llama-scout-17b via MaaS). Open-ended ReAct loops on sub-20B models are unreliable: the model exits early, selects wrong tools, mis-formats tool arguments, or fabricates remediation actions in its report. The pipeline eliminates model discretion entirely:
+
+| Node | Who drives it | What can go wrong |
+|------|--------------|-------------------|
+| 1 process_inspect | Pure Python | Nothing — tool calls are hardcoded |
+| 2 host_triage | Pure Python | Nothing — tool calls are hardcoded |
+| 3 classify | LLM (structured output) | Only classification quality; falls back to rule-based |
+| 4 remediate | Pure Python | Nothing — template IDs are constants; args are `json.dumps()` |
+| 5 report | LLM (plain text) | Only prose quality; no JSON output required |
+
+The LLM never selects tools, never formats arguments, never decides what step comes next, and never writes the `IncidentReport` JSON — Python assembles it from the pipeline's typed outputs.
 
 ## Components
 
 | Component | Technology | Role |
 |-----------|-----------|------|
-| Target host | RHEL (VM or bare metal) | Attack surface |
-| Runtime detection | [Falco](https://falco.org/) | Behavioral anomaly detection, webhook trigger |
-| System telemetry | [linux-mcp-server](https://github.com/rhel-lightspeed/linux-mcp-server) | Read-only RHEL introspection via MCP |
-| AI agent | Claude (claude-sonnet-4-6 or later) | Threat reasoning and response decisions |
-| Remediation | [Ansible Automation Platform 2.6](https://www.redhat.com/en/technologies/management/ansible) + MCP Server | Auditable, pre-approved playbook execution |
-| AAP hosting | OpenShift Developer Sandbox | AAP + MCP server deployment |
+| Target host | RHEL 9 (KubeVirt VM `rhel9-brown-loon-92`) | Attack surface |
+| Runtime detection | Falco 0.44.1 (modern eBPF) | Behavioral anomaly detection, webhook trigger |
+| System telemetry | [linux-mcp-server](https://github.com/rhel-lightspeed/linux-mcp-server) | Read-only RHEL introspection via MCP (SSH stdio) |
+| AI agent | LangGraph pipeline + llama-scout-17b (MaaS) | Threat classification and summary |
+| Remediation | Ansible Automation Platform 2.6 + AAP MCP Server | Auditable, pre-approved playbook execution |
+| Deployment | OpenShift (same namespace as AAP) | Agent pod, image build via BuildConfig |
 
 ## Demo Flow
 
-1. **Initial foothold** — attacker authenticates as a low-privilege user (e.g. via SSH)
-2. **Exploit** — attacker runs Copy Fail or Fragnesia PoC, corrupting a setuid binary in the page cache
-3. **Detection** — Falco fires on the behavioral signature (setuid binary spawning unexpected root shell) and sends a webhook to the agent
-4. **Investigation** — Claude agent queries the RHEL host via `linux-mcp-server`:
-   - Confirms process tree and parent-child relationship
-   - Checks active network connections for C2 indicators
-   - Reads audit log for privilege escalation events
-5. **Reasoning** — Agent identifies the CVE pattern, assesses blast radius, and selects the appropriate response playbook
-6. **Remediation** — Agent triggers AAP job template with relevant parameters (PID, username, module to blacklist)
-7. **Report** — Agent outputs a structured incident summary: what was detected, what was done, and what patch is required
+1. **SSH in as cloud-user** on `rhel9-brown-loon-92`.
+2. **Run the exploit**: `python3.11 exploit.py` — corrupts `/usr/bin/su` in the page cache via AF_ALG socket + splice, then execve-replaces it with a root shell.
+3. **Falco fires** the `Root Shell Spawned Directly by User Shell` rule (CRITICAL priority) and POSTs a JSON webhook to the agent.
+4. **Agent pipeline runs**:
+   - Looks up the root `sh` process and its `bash` parent via `get_process_info`
+   - Pulls journal logs and network connections from the host
+   - LLM classifies: `confirmed_threat`, `CVE-2026-31431`
+   - Python deterministically launches all three AAP playbooks
+   - LLM writes a one-paragraph summary
+5. **Webhook response** returns a structured `IncidentReport` with real AAP job IDs in `actions_taken`.
+
+## Falco Rules
+
+Custom rules are in `falco-rules/` (deployed to `/etc/falco/rules.d/` on the VM):
+
+| File | Rules |
+|------|-------|
+| `copy_fail.yaml` | AF_ALG socket creation (disabled/informational), splice into algif fd (ERROR), root shell spawned by user shell (CRITICAL) |
+| `fragnesia.yaml` | CLONE_NEWUSER unshare, ESP module load, GRO UDP socket, same root shell rule |
+
+The CRITICAL rule that triggers the demo:
+```yaml
+- rule: Root Shell Spawned Directly by User Shell
+  condition: >
+    spawned_process and not container and
+    user.uid = 0 and
+    proc.name in (bash, sh, dash, zsh, ...) and
+    proc.pname in (bash, sh, dash, zsh, ...)
+  priority: CRITICAL
+```
+
+This fires when a root shell's direct parent is a user shell — the execve() replacement fingerprint of both CVEs. Legitimate su/sudo never produce this parent relationship.
+
+## Remediation Playbooks
+
+Located in `playbooks/`, executed via AAP job templates:
+
+| Playbook | AAP Template ID | Action |
+|----------|----------------|--------|
+| `drop_page_cache.yml` | 10 | Flushes page cache (`echo 3 > /proc/sys/vm/drop_caches`), forcing reload of the clean on-disk binary |
+| `kill_session.yml` | 8 | Terminates the escalated root shell process by PID |
+| `lock_user.yml` | 11 | Writes audit record to `/var/log/security-incidents/` (non-destructive for demo — a real deployment would lock the account) |
+
+Extra vars are passed as JSON strings. The target host is always `rhel9-brown-loon-92-ssh` (stable K8s Service DNS, same namespace as AAP).
+
+## Deployment
+
+```bash
+# Build and push image
+oc start-build threat-response-agent --from-dir=. --follow
+
+# Roll out new image (imagePullPolicy: Always ensures latest is used)
+oc rollout restart deployment/threat-response-agent
+
+# Watch logs
+oc logs -f deployment/threat-response-agent
+```
+
+Secrets required:
+- `threat-response-agent-secrets` — keys: `OPENAI_API_KEY`, `AAP_TOKEN`, `LANGCHAIN_API_KEY` (optional)
+- `agent-ssh-privkey` — key: `id_rsa` (mounted at `/ssh/id_rsa`)
 
 ## Why behavioral detection matters
 
 Both CVEs leave on-disk files untouched. Standard defenses that miss this:
 
-- File integrity monitoring (AIDE, Tripwire) — hashes the on-disk file, which is clean
-- Antivirus / EDR signature scanning — no malicious binary written to disk
-- `rpm -V` package verification — package files unchanged
+- **File integrity monitoring** (AIDE, Tripwire) — hashes the on-disk file, which is clean
+- **Antivirus / EDR signature scanning** — no malicious binary written to disk
+- **`rpm -V` package verification** — package files unchanged
 
-Falco watches **syscall behavior at runtime**, catching the moment a setuid binary spawns a root shell regardless of whether the binary was modified on disk.
-
-## Remediation Playbooks
-
-| Playbook | Action |
-|----------|--------|
-| `block_module.yml` | Blacklists `algif_aead` (Copy Fail) or `esp4`/`esp6` (Fragnesia) |
-| `drop_page_cache.yml` | Flushes page cache (`echo 3 > /proc/sys/vm/drop_caches`) forcing reload from clean disk |
-| `kill_session.yml` | Terminates the escalated root shell process |
-| `lock_user.yml` | Locks the compromised user account pending investigation |
+Falco watches syscall behavior at runtime, catching the moment a setuid binary spawns a root shell regardless of whether the on-disk binary was modified.
 
 ## References
 
@@ -113,5 +167,5 @@ Falco watches **syscall behavior at runtime**, catching the moment a setuid bina
 - [CVE-2026-46300 — Fragnesia (Help Net Security)](https://www.helpnetsecurity.com/2026/05/14/fragnesia-cve-2026-46300-linux-lpe-vulnerability/)
 - [CVE-2026-46300 — Tenable FAQ](https://www.tenable.com/blog/fragnesia-cve-2026-46300-faq-about-new-linux-kernel-xfrm-esp-in-tcp-priv-esc)
 - [linux-mcp-server](https://github.com/rhel-lightspeed/linux-mcp-server)
-- [AAP MCP Server docs](https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.6/extend-assembly_deploying_ansible_mcp_server)
+- [AAP MCP Server](https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.6/extend-assembly_deploying_ansible_mcp_server)
 - [Falco](https://falco.org/)
