@@ -50,9 +50,10 @@ AAP_TOKEN = os.getenv("AAP_TOKEN", "")
 
 AAP_TARGET_HOST  = "rhel9-brown-loon-92-ssh"
 AAP_TEMPLATE_IDS = {
-    "drop_page_cache": 10,
-    "kill_session":     8,
-    "lock_user":       11,
+    "drop_page_cache":       10,
+    "kill_session":           8,
+    "lock_user":             11,
+    "write_incident_report":  0,   # TODO: set after creating template in AAP
 }
 
 LINUX_TOOLS = {
@@ -403,6 +404,40 @@ async def _node_classify(
 # Node 4 — AAP Remediation (pure Python, deterministic dispatch)
 # ---------------------------------------------------------------------------
 
+async def _launch_aap_playbook(
+    launch_tool,
+    retrieve_tool,
+    name: str,
+    template_id: int,
+    extra_vars: str,
+    ilog,
+) -> Optional[str]:
+    """Launch one AAP playbook and return a human-readable action string, or None on failure."""
+    if template_id == 0:
+        ilog.warning("node4.skip_playbook", playbook=name, msg="Template ID not configured (0)")
+        return None
+    try:
+        ilog.info("node4.launch", playbook=name, template_id=template_id)
+        launch_result = await launch_tool.ainvoke(
+            {"id": str(template_id), "requestBody": {"extra_vars": extra_vars}}
+        )
+        result_text = str(launch_result)
+        m = re.search(r'"id":\s*(\d+)', result_text)
+        job_id = m.group(1) if m else None
+        if job_id:
+            ilog.info("node4.launched", playbook=name, job_id=job_id)
+            retrieve_result = await retrieve_tool.ainvoke({"id": job_id})
+            ilog.info("node4.retrieved", playbook=name, job_id=job_id,
+                      preview=str(retrieve_result)[:200])
+            return f"{name} (job_id={job_id})"
+        else:
+            ilog.warning("node4.no_job_id", playbook=name, result=result_text[:300])
+            return f"{name} (launched, no job_id in response)"
+    except Exception as exc:
+        ilog.error("node4.launch_failed", playbook=name, error=str(exc))
+        return None
+
+
 async def _node_remediate(
     aap_tools: dict[str, Any],
     verdict: str,
@@ -410,8 +445,9 @@ async def _node_remediate(
     ilog,
 ) -> list[str]:
     """
-    If verdict warrants remediation, deterministically launch the three
-    pre-approved AAP playbooks. No LLM involved.
+    Deterministically launch the three remediation playbooks if verdict warrants it.
+    No LLM involved. write_incident_report is called separately after the report
+    is assembled, so it can include the full IncidentReport JSON.
 
     Playbooks:
       drop_page_cache (id=10) — purges corrupted page cache entries
@@ -424,13 +460,10 @@ async def _node_remediate(
 
     launch_tool   = aap_tools.get("job_templates_launch_create")
     retrieve_tool = aap_tools.get("jobs_retrieve")
-
     if not launch_tool or not retrieve_tool:
         ilog.warning("node4.missing_tools", msg="AAP tools not available")
         return []
 
-    # extra_vars must be a JSON-encoded string nested inside requestBody,
-    # per the AAP MCP tool schema: {"id": "...", "requestBody": {"extra_vars": "..."}}
     playbooks = [
         ("drop_page_cache", AAP_TEMPLATE_IDS["drop_page_cache"],
          json.dumps({"target_host": AAP_TARGET_HOST})),
@@ -444,31 +477,41 @@ async def _node_remediate(
 
     actions: list[str] = []
     for name, template_id, extra_vars in playbooks:
-        try:
-            ilog.info("node4.launch", playbook=name, template_id=template_id)
-            launch_result = await launch_tool.ainvoke(
-                {"id": str(template_id), "requestBody": {"extra_vars": extra_vars}}
-            )
-            result_text = str(launch_result)
-
-            job_id = None
-            m = re.search(r'"id":\s*(\d+)', result_text)
-            if m:
-                job_id = m.group(1)
-
-            if job_id:
-                ilog.info("node4.launched", playbook=name, job_id=job_id)
-                retrieve_result = await retrieve_tool.ainvoke({"id": job_id})
-                ilog.info("node4.retrieved", playbook=name, job_id=job_id,
-                          preview=str(retrieve_result)[:200])
-                actions.append(f"{name} (job_id={job_id})")
-            else:
-                ilog.warning("node4.no_job_id", playbook=name, result=result_text[:300])
-                actions.append(f"{name} (launched, no job_id in response)")
-        except Exception as exc:
-            ilog.error("node4.launch_failed", playbook=name, error=str(exc))
-
+        result = await _launch_aap_playbook(
+            launch_tool, retrieve_tool, name, template_id, extra_vars, ilog
+        )
+        if result:
+            actions.append(result)
     return actions
+
+
+async def _write_report_to_host(
+    aap_tools: dict[str, Any],
+    incident_id: str,
+    report: "IncidentReport",
+    ilog,
+) -> None:
+    """Ship the assembled IncidentReport JSON to the host via AAP playbook."""
+    template_id = AAP_TEMPLATE_IDS.get("write_incident_report", 0)
+    if template_id == 0:
+        ilog.warning("write_report.skip", msg="write_incident_report template ID not configured")
+        return
+
+    launch_tool   = aap_tools.get("job_templates_launch_create")
+    retrieve_tool = aap_tools.get("jobs_retrieve")
+    if not launch_tool or not retrieve_tool:
+        ilog.warning("write_report.missing_tools")
+        return
+
+    extra_vars = json.dumps({
+        "target_host":          AAP_TARGET_HOST,
+        "incident_id":          incident_id,
+        "incident_report_json": report.model_dump_json(indent=2),
+    })
+    await _launch_aap_playbook(
+        launch_tool, retrieve_tool,
+        "write_incident_report", template_id, extra_vars, ilog,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -624,6 +667,12 @@ class ThreatResponseAgent:
             cves=report.cve_ids,
             actions=len(report.actions_taken),
         )
+
+        # ── Write report to host via AAP playbook ────────────────────────────
+        # Done after assembly so the full report (including summary and
+        # actions_taken with real job IDs) is persisted to the host.
+        await _write_report_to_host(self._aap_tools, incident_id, report, ilog)
+
         return report
 
 

@@ -1,0 +1,35 @@
+---
+# Write the agent's structured incident report JSON to the compromised host.
+# This creates a permanent forensic record on the host itself, co-located
+# with the audit entry written by lock_user.yml.
+#
+# Extra vars expected:
+#   target_host:          RHEL host to write the report on
+#   incident_id:          short UUID used as the filename
+#   incident_report_json: full IncidentReport serialised as a JSON string
+
+- name: Write agent incident report to host
+  hosts: "{{ target_host }}"
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Ensure security incidents directory exists
+      ansible.builtin.file:
+        path: /var/log/security-incidents
+        state: directory
+        mode: '0750'
+        owner: root
+        group: root
+
+    - name: Write incident report JSON
+      ansible.builtin.copy:
+        dest: "/var/log/security-incidents/{{ incident_id }}.json"
+        content: "{{ incident_report_json }}"
+        mode: '0640'
+        owner: root
+        group: root
+
+    - name: Report written
+      ansible.builtin.debug:
+        msg: "Incident report written to /var/log/security-incidents/{{ incident_id }}.json"
