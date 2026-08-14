@@ -427,6 +427,8 @@ async def _node_remediate(
         ilog.warning("node4.missing_tools", msg="AAP tools not available")
         return []
 
+    # extra_vars must be a JSON-encoded string nested inside requestBody,
+    # per the AAP MCP tool schema: {"id": "...", "requestBody": {"extra_vars": "..."}}
     playbooks = [
         ("drop_page_cache", AAP_TEMPLATE_IDS["drop_page_cache"],
          json.dumps({"target_host": AAP_TARGET_HOST})),
@@ -443,7 +445,7 @@ async def _node_remediate(
         try:
             ilog.info("node4.launch", playbook=name, template_id=template_id)
             launch_result = await launch_tool.ainvoke(
-                {"id": str(template_id), "extra_vars": extra_vars}
+                {"id": str(template_id), "requestBody": {"extra_vars": extra_vars}}
             )
             result_text = str(launch_result)
 
