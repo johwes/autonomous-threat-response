@@ -367,6 +367,42 @@ closed-world specification, violated. The incident report carries both results s
 by side in `conventional_methods_bypassed` and `detection_method`, so that the
 distinction is visible in the output, not just implicit in the architecture.
 
+### Academic Foundations
+
+This approach has a 30-year academic pedigree. The terminology and formal framework
+were established in two foundational papers from the UC Davis research group:
+
+- **Ko, Ruschitzka, Levitt** — *Automated Detection of Vulnerabilities in Privileged Programs by Execution Monitoring* (ACSAC 1994): established execution monitoring of setuid programs as a security primitive. The specific focus on setuid binaries — precisely the class of program exploited by Copy Fail — was the starting point of the formal model.
+
+- **Ko, Fraser, Blackledge, Levitt** — *Execution Monitoring of Security-Critical Programs in Distributed Systems: A Specification-Based Approach* (IEEE S&P 1997): coined the term **specification-based intrusion detection** and distinguished it formally from two other models:
+  - *Misuse detection* — match against signatures of known-bad behavior (what EDR does)
+  - *Anomaly detection* — flag statistical deviation from learned normal (what ML-based tools do)
+  - *Specification-based detection* — flag any deviation from a formal specification of correct behavior, regardless of whether the deviation matches any known attack
+
+The 1997 paper's key insight: specification-based detection is independent of attacker
+knowledge. A specification does not describe attacks. It describes correct operation.
+Anything outside correct operation is flagged — including attacks that did not exist
+when the specification was written.
+
+This demo is a direct implementation of that 1997 model: the Falco rule is the
+specification, the Falco alert is the deviation event, and the agent pipeline is
+the response layer the paper described but could not fully implement in 1997.
+
+**What changed between 1997 and now**: the practical barrier was always the
+specification itself. The 1997 paper assumed specifications existed and focused on
+the detection and response machinery. In practice, writing and maintaining accurate
+behavioral specifications for general-purpose software was intractable — too expensive,
+too brittle, too incomplete. The approach remained academically compelling but
+operationally marginal.
+
+Red Hat's position in 2026 is that the specifications now exist — not as hand-written
+security artifacts, but as the natural output of the platform: SELinux policy is the
+syscall and file-path specification. systemd unit files are the process ancestry
+specification. RPM metadata is the file-integrity specification. NetworkPolicy is the
+network socket specification. These were written to describe correct operation, not
+to enable security monitoring. The security application is a consequence of their
+existence and precision.
+
 ---
 
 ## Red Hat's Position
