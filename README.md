@@ -243,6 +243,13 @@ Both CVEs leave on-disk files untouched. Standard defenses that miss this:
 
 Falco watches syscall behavior at runtime, catching the moment a setuid binary spawns a root shell regardless of whether the on-disk binary was modified.
 
+## Example Incident Output
+
+`example-incident-log.json` contains a real incident report captured from a live demo run.
+
+For a full end-to-end explanation of the attack, the detection logic, and a field-by-field
+walkthrough of the incident log, see [WALKTHROUGH.md](WALKTHROUGH.md).
+
 ## References
 
 - [CVE-2026-31431 — Copy Fail (Palo Alto Unit42)](https://unit42.paloaltonetworks.com/cve-2026-31431-copy-fail/)
