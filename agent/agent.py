@@ -18,6 +18,7 @@ Remediation tools:   AAP MCP server via streamable-HTTP.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -60,8 +61,6 @@ LINUX_TOOLS = {
     "get_process_info",
     "get_journal_logs",
     "get_network_connections",
-    "get_file_info",
-    "run_command",
 }
 AAP_TOOLS = {
     "job_templates_launch_create",
@@ -275,66 +274,86 @@ def _extract_ppid(proc_text: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# SSH helper — direct command execution on the RHEL host
+# ---------------------------------------------------------------------------
+
+async def _ssh_run(command: str, ilog, label: str) -> tuple[int, str, str]:
+    """Run a single command on the target host over SSH, return (rc, stdout, stderr)."""
+    ilog.info("ssh.run", label=label, command=command)
+    proc = await asyncio.create_subprocess_exec(
+        "ssh",
+        "-i", LINUX_MCP_SSH_KEY,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        f"{LINUX_MCP_SSH_USER}@{LINUX_MCP_SSH_HOST}",
+        command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+    rc = proc.returncode or 0
+    ilog.info("ssh.done", label=label, rc=rc)
+    return rc, stdout.decode(errors="replace"), stderr.decode(errors="replace")
+
+
+# ---------------------------------------------------------------------------
 # Node 1b — Specification Verifier (pure Python, no LLM)
 # ---------------------------------------------------------------------------
 
-async def _node_spec_verify(
-    tools: dict[str, Any],
-    ilog,
-) -> SpecVerifyResult:
+async def _node_spec_verify(ilog) -> SpecVerifyResult:
     """
-    Runs the conventional integrity checks that Copy Fail bypasses, then
-    records the Falco rule's invariant as the actual detection mechanism.
+    Runs the conventional integrity checks that Copy Fail bypasses via direct
+    SSH, then records the Falco rule's invariant as the actual detection mechanism.
 
     Copy Fail corrupts /usr/bin/su in the kernel page cache (in-memory),
     not on disk. So:
-      - get_file_info /usr/bin/su  → on-disk file is clean (attack bypasses it)
-      - rpm -V shadow-utils        → package hash matches on-disk file (also bypassed)
-      - getenforce                 → SELinux is enforcing but operates at syscall layer;
-                                     page cache corruption happens before execve fires,
-                                     so SELinux cannot intercept the corruption itself
+      - stat + sha256sum /usr/bin/su  → on-disk file is clean (attack bypasses it)
+      - rpm -V shadow-utils           → package hash matches on-disk file (also bypassed)
+      - getenforce                    → SELinux is enforcing but operates at syscall layer;
+                                        page cache corruption happens before execve fires,
+                                        so SELinux cannot intercept the corruption itself
 
     None of these prove the specification was violated — the Falco rule does that.
     These checks prove that conventional file-integrity defenses were structurally
     blind to this attack. Only the behavioral specification (process ancestry invariant)
     generated a signal.
     """
-    gfi = tools.get("get_file_info")
-    run = tools.get("run_command")
-
     on_disk_clean = False
     rpm_clean = False
     selinux_enforcing = False
     bypassed: list[str] = []
 
-    # Check 1: on-disk file integrity of the corrupted setuid binary
-    if gfi:
-        result = await _call_tool(gfi, {"path": "/usr/bin/su"}, ilog, "spec_verify.file_info")
-        # If we got a result without error, the file is readable and intact on disk
-        on_disk_clean = bool(result) and "ERROR" not in result
-        if on_disk_clean:
-            bypassed.append("File integrity check (/usr/bin/su): on-disk binary unchanged — page cache corruption leaves no on-disk trace")
-    else:
-        ilog.warning("spec_verify.no_get_file_info")
+    # Check 1: on-disk file integrity — stat + sha256sum the binary directly
+    rc, out, _ = await _ssh_run(
+        "stat /usr/bin/su && sha256sum /usr/bin/su",
+        ilog, "spec_verify.file_info",
+    )
+    on_disk_clean = rc == 0 and bool(out.strip())
+    if on_disk_clean:
+        bypassed.append(
+            f"File integrity check (/usr/bin/su): on-disk binary is present and readable "
+            f"— page cache corruption leaves no on-disk trace. {out.strip()}"
+        )
 
-    # Check 2: RPM package verification (run_command may not be available)
-    if run:
-        rpm_result = await _call_tool(run, {"command": "rpm -V shadow-utils"}, ilog, "spec_verify.rpm_verify")
-        # rpm -V exits 0 and produces no output when everything is clean
-        rpm_clean = bool(rpm_result) and "ERROR" not in rpm_result and rpm_result.strip() == ""
-        if rpm_clean:
-            bypassed.append("RPM package verification (rpm -V shadow-utils): package files match RPM database — on-disk binary is clean")
+    # Check 2: RPM package verification
+    rc, out, _ = await _ssh_run("rpm -V shadow-utils", ilog, "spec_verify.rpm_verify")
+    # rpm -V exits 0 with no output when all package files are clean
+    rpm_clean = rc == 0 and not out.strip()
+    if rpm_clean:
+        bypassed.append(
+            "RPM package verification (rpm -V shadow-utils): all package files match "
+            "the RPM database — on-disk binary is clean"
+        )
 
-        # Check 3: SELinux enforcement status
-        se_result = await _call_tool(run, {"command": "getenforce"}, ilog, "spec_verify.getenforce")
-        selinux_enforcing = "enforcing" in se_result.lower()
-        if selinux_enforcing:
-            bypassed.append(
-                "SELinux: enforcing mode active — but page cache corruption occurs before execve() fires, "
-                "so the corruption itself is below the syscall layer SELinux monitors"
-            )
-    else:
-        ilog.warning("spec_verify.no_run_command", msg="rpm -V and getenforce skipped — run_command not available")
+    # Check 3: SELinux enforcement status
+    rc, out, _ = await _ssh_run("getenforce", ilog, "spec_verify.getenforce")
+    selinux_enforcing = rc == 0 and "enforcing" in out.lower()
+    if selinux_enforcing:
+        bypassed.append(
+            "SELinux: enforcing mode active — but page cache corruption occurs before "
+            "execve() fires, so the corruption is below the syscall layer SELinux monitors"
+        )
 
     result = SpecVerifyResult(
         on_disk_file_clean=on_disk_clean,
@@ -753,7 +772,7 @@ class ThreatResponseAgent:
         # specification was violated; this node proves conventional methods were blind.
         ilog.info("pipeline.node1b", step="spec_verify")
         try:
-            spec_verify = await _node_spec_verify(self._linux_tools, ilog)
+            spec_verify = await _node_spec_verify(ilog)
         except Exception as exc:
             ilog.error("node1b.spec_verify_failed", error=str(exc))
             spec_verify = None
