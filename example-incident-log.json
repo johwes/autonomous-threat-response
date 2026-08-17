@@ -1,0 +1,35 @@
+{
+  "incident_id": "510fdef5",
+  "rule": "Root Shell Spawned Directly by User Shell",
+  "host": "rhel9-brown-loon-92",
+  "verdict": "confirmed_threat",
+  "cve_ids": [
+    "CVE-2026-31431"
+  ],
+  "summary": "On host rhel9-brown-loon-92, a root shell with PID 3665 was spawned directly by a user shell (bash) with PID 3423, which is an architecturally impossible event under normal operation, encoded in the Falco rule and matching the execve() replacement pattern of Copy Fail, related to CVE-2026-31431. Conventional integrity checks, including file hash (5caff5036909df3c2d8baca06c9d4039693fcba9d3aaf62a7be8b3b09a59acbf for /usr/bin/su) and RPM verification (rpm -V shadow-utils), returned clean, indicating that detection was achieved exclusively via behavioral specification violation. The violated invariant, enforced by the RHEL process ancestry, dictates that a root shell should never spawn directly from a user shell without the intermediary of a su or sudo binary. Remediation actions included dropping the page cache, killing the session, and locking the user, as part of incident response playbook execution, specifically jobs 48, 50, and 51.",
+  "evidence": [
+    "Falco: 07:22:21.618948448: Critical Root shell spawned directly by user shell — possible LPE via page cache corruption (user=root uid=0 pid=3665 ppid=3423\n comm=sh parent=bash cmdline=sh\n pcmdline=bash container=host) container_id=host container_name=host container_image_repository= container_image_tag= k8",
+    "Root shell process: [{'type': 'text', 'text': '=== Process Information for PID 3665 ===\\n\\nPID USER     STAT %CPU %MEM    VSZ   RSS     ELAPSED COMMAND         COMMAND\\n   3665 root     S+    1.0  0.2   4916  4084       00:05 sh\\n\\n=== Detailed Status (/proc) ===\\nName: sh\\nState: S (sleeping)\\nTgid: 3665\\nPid: 3665\\nP",
+    "Parent process: [{'type': 'text', 'text': '=== Process Information for PID 3423 ===\\n\\nPID USER     STAT %CPU %MEM    VSZ   RSS     ELAPSED COMMAND         COMMAND\\n   3423 cloud-u+ Ss    0.0  0.2   4940  4136       02:22 bash            -bash\\n\\n=== Detailed Status (/proc) ===\\nName: bash\\nState: S (sleeping)\\nTgi",
+    "Journal: [{'type': 'text', 'text': '{\"entries\":[\"Aug 17 07:10:52 localhost kernel: Linux version 5.14.0-687.5.1.el9_8.x86_64 (mockbuild@x86-64-04.build.eng.rdu2.redhat.com) (gcc (GCC) 11.5.0 20240719 (Red Hat ",
+    "Network: [{'type': 'text', 'text': '=== Active Network Connections ===\\n\\nProto    Local Address                  Remote Address                 Status          PID/Program\\n-----------------------------------"
+  ],
+  "actions_taken": [
+    "drop_page_cache (job_id=48)",
+    "kill_session (job_id=50)",
+    "lock_user (job_id=51)"
+  ],
+  "recommended_next_steps": [
+    "Apply kernel patch for CVE-2026-31431 (Copy Fail page cache corruption)",
+    "Review /var/log/security-incidents/ for the audit record written by lock_user playbook",
+    "Rotate SSH keys and credentials for cloud-user",
+    "Monitor host for re-exploitation attempts",
+    "File incident ticket with forensic artifacts"
+  ],
+  "detection_method": "behavioral_specification_violation",
+  "conventional_methods_bypassed": [
+    "File integrity check (/usr/bin/su): on-disk binary is present and readable — page cache corruption leaves no on-disk trace. File: /usr/bin/su\n  Size: 56936     \tBlocks: 112        IO Block: 4096   regular file\nDevice: fc04h/64516d\tInode: 16909316    Links: 1\nAccess: (4755/-rwsr-xr-x)  Uid: (    0/    root)   Gid: (    0/    root)\nContext: system_u:object_r:su_exec_t:s0\nAccess: 2026-08-17 07:22:21.614000000 -0400\nModify: 2026-01-19 05:52:55.000000000 -0500\nChange: 2026-04-28 16:14:32.631797083 -0400\n Birth: 2026-04-28 16:14:32.631797083 -0400\n5caff5036909df3c2d8baca06c9d4039693fcba9d3aaf62a7be8b3b09a59acbf  /usr/bin/su",
+    "RPM package verification (rpm -V shadow-utils): all package files match the RPM database — on-disk binary is clean",
+    "SELinux: enforcing mode active — but page cache corruption occurs before execve() fires, so the corruption is below the syscall layer SELinux monitors"
+  ]
+}
