@@ -151,7 +151,8 @@ The LLM never selects tools, never formats arguments, never decides what step co
 |-----------|-----------|------|
 | Target host | RHEL 9 (KubeVirt VM `rhel9-brown-loon-92`) | Attack surface |
 | Runtime detection | Falco 0.44.1 (modern eBPF) | Behavioral anomaly detection, webhook trigger |
-| System telemetry | [linux-mcp-server](https://github.com/rhel-lightspeed/linux-mcp-server) | Read-only RHEL introspection via MCP (SSH stdio); spec_verify checks run via direct SSH |
+| System telemetry (nodes 1, 2) | [linux-mcp-server](https://github.com/rhel-lightspeed/linux-mcp-server) | Read-only RHEL introspection via MCP (SSH stdio): `get_process_info`, `get_journal_logs`, `get_network_connections` |
+| Spec verification (node 1b) | Direct SSH | `stat`+`sha256sum`, `rpm -V`, `getenforce` — run via raw SSH because linux-mcp-server has no file integrity or RPM verification tools |
 | AI agent | LangGraph pipeline + llama-scout-17b (MaaS) | Threat classification and summary |
 | Remediation | Ansible Automation Platform 2.6 + AAP MCP Server | Auditable, pre-approved playbook execution |
 | Deployment | OpenShift (same namespace as AAP) | Agent pod, image build via BuildConfig |
