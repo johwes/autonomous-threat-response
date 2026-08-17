@@ -34,9 +34,9 @@ Attacker (low-priv user on RHEL host)
 │    get_process_info(parent_pid)          │
 │                                          │
 │  Node 1b: spec_verify     (pure Python)  │
-│    get_file_info(/usr/bin/su)            │  ← on-disk file is CLEAN
-│    rpm -V shadow-utils                   │  ← package hash is CLEAN
-│    getenforce                            │  ← SELinux enforcing, missed it
+│    stat + sha256sum /usr/bin/su  (SSH)   │  ← on-disk file is CLEAN
+│    rpm -V shadow-utils           (SSH)   │  ← package hash is CLEAN
+│    getenforce                    (SSH)   │  ← SELinux enforcing, missed it
 │    → conventional_methods_bypassed[]     │  ← proof of conventional blindness
 │                                          │
 │  Node 2: host_triage      (pure Python)  │
@@ -151,7 +151,7 @@ The LLM never selects tools, never formats arguments, never decides what step co
 |-----------|-----------|------|
 | Target host | RHEL 9 (KubeVirt VM `rhel9-brown-loon-92`) | Attack surface |
 | Runtime detection | Falco 0.44.1 (modern eBPF) | Behavioral anomaly detection, webhook trigger |
-| System telemetry | [linux-mcp-server](https://github.com/rhel-lightspeed/linux-mcp-server) | Read-only RHEL introspection via MCP (SSH stdio) |
+| System telemetry | [linux-mcp-server](https://github.com/rhel-lightspeed/linux-mcp-server) | Read-only RHEL introspection via MCP (SSH stdio); spec_verify checks run via direct SSH |
 | AI agent | LangGraph pipeline + llama-scout-17b (MaaS) | Threat classification and summary |
 | Remediation | Ansible Automation Platform 2.6 + AAP MCP Server | Auditable, pre-approved playbook execution |
 | Deployment | OpenShift (same namespace as AAP) | Agent pod, image build via BuildConfig |
