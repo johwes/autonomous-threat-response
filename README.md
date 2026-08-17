@@ -33,6 +33,12 @@ Attacker (low-priv user on RHEL host)
 │    get_process_info(root_pid)            │
 │    get_process_info(parent_pid)          │
 │                                          │
+│  Node 1b: spec_verify     (pure Python)  │
+│    get_file_info(/usr/bin/su)            │  ← on-disk file is CLEAN
+│    rpm -V shadow-utils                   │  ← package hash is CLEAN
+│    getenforce                            │  ← SELinux enforcing, missed it
+│    → conventional_methods_bypassed[]     │  ← proof of conventional blindness
+│                                          │
 │  Node 2: host_triage      (pure Python)  │
 │    get_journal_logs(since="-15m")        │
 │    get_network_connections()             │
@@ -60,6 +66,70 @@ Attacker (low-priv user on RHEL host)
 │  via stable K8s Service DNS              │
 └──────────────────────────────────────────┘
 ```
+
+## Specification Deviation: what this demo proves
+
+Detection and response are the visible output. The deeper argument is about *signal quality*.
+
+### The problem with conventional defenses
+
+Both CVEs corrupt `/usr/bin/su` in the kernel page cache — in memory, not on disk. Two versions of the binary coexist:
+
+- **On disk**: clean, untouched original
+- **In memory (page cache)**: corrupted version that spawns a root shell when invoked
+
+This makes an entire class of defenses structurally blind:
+
+| Defense | Why it misses this | Signal returned |
+|---------|-------------------|-----------------|
+| File integrity monitoring (AIDE, Tripwire) | Hashes the on-disk binary | Clean |
+| `rpm -V shadow-utils` | Checks on-disk file against RPM database | Clean |
+| Antivirus / EDR signature scanning | No malicious binary written to disk | Clean |
+| SELinux | Policy enforced at syscall boundary; page cache corruption happens below it | Enforcing, no denial |
+
+The demo's `spec_verify` node explicitly runs these checks and records that they all returned clean. This is not accidental — it is the point.
+
+### The specification that fired
+
+The Falco rule is not a heuristic or a signature. It encodes a **RHEL process ancestry invariant**:
+
+> In a correctly specified RHEL environment, privilege elevation always interposes `su` or `sudo` between a user shell and a root shell. A uid=0 shell whose direct parent is a user-level interactive shell is architecturally impossible.
+
+This invariant is derived from the declared specification of the RHEL software stack — how `su`, `sudo`, PAM, and the login session hierarchy are supposed to behave. It is true for every RHEL host, for every attacker technique, for any future CVE that achieves LPE via the same mechanism.
+
+The rule fires because the specification was violated — not because Copy Fail or Fragnesia are known.
+
+### Why Red Hat has an advantage here
+
+The unfair advantage is not knowledge of attacker behavior. CrowdStrike, Palo Alto, and Microsoft all have better threat intel than Red Hat. The advantage is knowledge of **intended behavioral state**:
+
+- SELinux policy declares the permitted syscall profile for every confined domain
+- systemd unit files declare the permitted network, filesystem, and capability envelope for every service
+- RPM metadata declares the expected content, permissions, and integrity of every installed file
+- NetworkPolicy and OPA Gatekeeper declare the permitted communication graph for every workload
+
+Any deviation from those declared specifications is a high-confidence signal — regardless of whether the attack technique is known. This is a closed-world assumption: everything not declared is denied. Conventional EDR/XDR operates under an open-world assumption: everything not known-bad is permitted.
+
+### What the IncidentReport carries
+
+The `IncidentReport` response now includes two fields that make this argument verifiable:
+
+```json
+{
+  "detection_method": "behavioral_specification_violation",
+  "conventional_methods_bypassed": [
+    "file_integrity_check: /usr/bin/su on-disk file is clean — attack bypassed on-disk integrity",
+    "rpm_verification: shadow-utils package verification passed — attack bypassed package integrity",
+    "selinux: enforcing mode active but insufficient for page-cache attacks below the syscall boundary"
+  ]
+}
+```
+
+The spec_verify node (Node 1b) runs these checks synchronously before classification. The LLM report node is instructed to reference them explicitly in its summary paragraph.
+
+### The SELinux precedent
+
+Red Hat shipped SELinux in permissive mode in RHEL 4 and 5. The policy was incomplete, noisy, and difficult to tune. Over several RHEL releases, Red Hat invested in `audit2allow`, policy tooling, and UX improvements until permissive-to-enforcing graduation became viable at scale. The same methodology applies here: specification deviation detection starts noisy, gets tuned, and eventually becomes the default enforcement layer.
 
 ## Why a deterministic pipeline instead of a ReAct agent
 

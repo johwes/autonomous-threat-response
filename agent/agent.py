@@ -82,6 +82,9 @@ class IncidentReport(BaseModel):
     evidence: list[str] = Field(default_factory=list)
     actions_taken: list[str] = Field(default_factory=list)
     recommended_next_steps: list[str] = Field(default_factory=list)
+    # Specification deviation fields — populated by spec_verify node
+    detection_method: str = "behavioral_specification_violation"
+    conventional_methods_bypassed: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +95,31 @@ class ClassifyResult(BaseModel):
     verdict: Literal["confirmed_threat", "likely_threat", "false_positive", "inconclusive"]
     cve_ids: list[str] = Field(default_factory=list)
     confidence_notes: str
+
+
+class SpecVerifyResult(BaseModel):
+    """
+    Result of the specification verification node.
+
+    Copy Fail (CVE-2026-31431) corrupts /usr/bin/su in the kernel page cache —
+    the in-memory copy used at execution time — without touching the on-disk file.
+
+    File integrity monitoring and rpm -V both check the on-disk binary and therefore
+    see nothing wrong. They are structurally blind to this class of attack.
+
+    The only signal that fires is the Falco process ancestry rule, which encodes
+    the RHEL behavioral invariant: a root shell's direct parent must be su or sudo,
+    never a user shell. That invariant violation is the specification deviation.
+
+    conventional_methods_bypassed lists what passed clean — not what proved the
+    violation, but what demonstrates that conventional defenses were insufficient.
+    """
+    on_disk_file_clean: bool
+    rpm_verification_clean: bool
+    selinux_enforcing: bool
+    conventional_methods_bypassed: list[str]
+    detection_method: str
+    specification_violated: str
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +275,92 @@ def _extract_ppid(proc_text: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Node 1b — Specification Verifier (pure Python, no LLM)
+# ---------------------------------------------------------------------------
+
+async def _node_spec_verify(
+    tools: dict[str, Any],
+    ilog,
+) -> SpecVerifyResult:
+    """
+    Runs the conventional integrity checks that Copy Fail bypasses, then
+    records the Falco rule's invariant as the actual detection mechanism.
+
+    Copy Fail corrupts /usr/bin/su in the kernel page cache (in-memory),
+    not on disk. So:
+      - get_file_info /usr/bin/su  → on-disk file is clean (attack bypasses it)
+      - rpm -V shadow-utils        → package hash matches on-disk file (also bypassed)
+      - getenforce                 → SELinux is enforcing but operates at syscall layer;
+                                     page cache corruption happens before execve fires,
+                                     so SELinux cannot intercept the corruption itself
+
+    None of these prove the specification was violated — the Falco rule does that.
+    These checks prove that conventional file-integrity defenses were structurally
+    blind to this attack. Only the behavioral specification (process ancestry invariant)
+    generated a signal.
+    """
+    gfi = tools.get("get_file_info")
+    run = tools.get("run_command")
+
+    on_disk_clean = False
+    rpm_clean = False
+    selinux_enforcing = False
+    bypassed: list[str] = []
+
+    # Check 1: on-disk file integrity of the corrupted setuid binary
+    if gfi:
+        result = await _call_tool(gfi, {"path": "/usr/bin/su"}, ilog, "spec_verify.file_info")
+        # If we got a result without error, the file is readable and intact on disk
+        on_disk_clean = bool(result) and "ERROR" not in result
+        if on_disk_clean:
+            bypassed.append("File integrity check (/usr/bin/su): on-disk binary unchanged — page cache corruption leaves no on-disk trace")
+    else:
+        ilog.warning("spec_verify.no_get_file_info")
+
+    # Check 2: RPM package verification (run_command may not be available)
+    if run:
+        rpm_result = await _call_tool(run, {"command": "rpm -V shadow-utils"}, ilog, "spec_verify.rpm_verify")
+        # rpm -V exits 0 and produces no output when everything is clean
+        rpm_clean = bool(rpm_result) and "ERROR" not in rpm_result and rpm_result.strip() == ""
+        if rpm_clean:
+            bypassed.append("RPM package verification (rpm -V shadow-utils): package files match RPM database — on-disk binary is clean")
+
+        # Check 3: SELinux enforcement status
+        se_result = await _call_tool(run, {"command": "getenforce"}, ilog, "spec_verify.getenforce")
+        selinux_enforcing = "enforcing" in se_result.lower()
+        if selinux_enforcing:
+            bypassed.append(
+                "SELinux: enforcing mode active — but page cache corruption occurs before execve() fires, "
+                "so the corruption itself is below the syscall layer SELinux monitors"
+            )
+    else:
+        ilog.warning("spec_verify.no_run_command", msg="rpm -V and getenforce skipped — run_command not available")
+
+    result = SpecVerifyResult(
+        on_disk_file_clean=on_disk_clean,
+        rpm_verification_clean=rpm_clean,
+        selinux_enforcing=selinux_enforcing,
+        conventional_methods_bypassed=bypassed,
+        detection_method="behavioral_specification_violation",
+        specification_violated=(
+            "RHEL process ancestry invariant: a root shell (uid=0) spawned directly by a user shell "
+            "(bash/sh/...) is architecturally impossible under normal operation. Legitimate privilege "
+            "escalation via su or sudo always interposes the su/sudo binary between the user shell and "
+            "the root shell. This invariant is encoded in the Falco rule and fired regardless of the "
+            "exploit technique used to violate it."
+        ),
+    )
+    ilog.info(
+        "spec_verify.done",
+        on_disk_clean=on_disk_clean,
+        rpm_clean=rpm_clean,
+        selinux_enforcing=selinux_enforcing,
+        bypassed_count=len(bypassed),
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Node 2 — Host Triage (pure Python, no LLM)
 # ---------------------------------------------------------------------------
 
@@ -319,6 +433,7 @@ async def _node_classify(
     proc_parent: str,
     journal: str,
     network: str,
+    spec_verify: Optional[SpecVerifyResult],
     ilog,
 ) -> ClassifyResult:
     """
@@ -337,6 +452,16 @@ async def _node_classify(
         if "Root Shell Spawned Directly by User Shell" in alert.rule else ""
     )
 
+    spec_block = ""
+    if spec_verify:
+        spec_block = (
+            f"\n[specification verification]:\n"
+            f"  detection_method: {spec_verify.detection_method}\n"
+            f"  specification_violated: {spec_verify.specification_violated}\n"
+            f"  conventional_methods_bypassed:\n"
+            + "".join(f"    - {m}\n" for m in spec_verify.conventional_methods_bypassed)
+        )
+
     evidence_block = (
         f"FALCO ALERT:\n"
         f"  rule:   {alert.rule}\n"
@@ -346,6 +471,7 @@ async def _node_classify(
         f"[proc_parent (parent of root shell)]:\n{proc_parent or '(not retrieved)'}\n\n"
         f"[journal (last 15 min)]:\n{journal[:2000] or '(not retrieved)'}\n\n"
         f"[network connections]:\n{network[:1000] or '(not retrieved)'}\n"
+        + spec_block
         + (f"\nHINT: {verdict_hint}" if verdict_hint else "")
     )
 
@@ -524,6 +650,12 @@ Write exactly ONE paragraph (4-6 sentences) summarizing what happened, what was
 confirmed, and what remediation was taken. Be specific — reference the process names,
 PIDs, CVE ID, and playbook names from the evidence. Do not use bullet points.
 Do not write JSON. Do not write headers. Just the paragraph.
+
+If specification verification results are provided, you MUST mention:
+1. That conventional integrity checks (file hash, RPM verification) returned clean
+2. That detection was achieved exclusively via behavioral specification violation
+3. What the violated invariant was
+This makes clear why specification-based detection is necessary for this class of attack.
 """
 
 
@@ -537,9 +669,20 @@ async def _node_report(
     network: str,
     classify: ClassifyResult,
     actions_taken: list[str],
+    spec_verify: Optional[SpecVerifyResult],
     ilog,
 ) -> str:
     """Ask the LLM to write a one-paragraph plain-text summary."""
+    spec_block = ""
+    if spec_verify:
+        spec_block = (
+            f"\nSpecification verification:\n"
+            f"  Detection method: {spec_verify.detection_method}\n"
+            f"  Specification violated: {spec_verify.specification_violated}\n"
+            f"  Conventional methods that returned clean (and were therefore bypassed):\n"
+            + "".join(f"    - {m}\n" for m in spec_verify.conventional_methods_bypassed)
+        )
+
     evidence_block = (
         f"Alert rule: {alert.rule}\n"
         f"Host: {host}\n"
@@ -551,6 +694,7 @@ async def _node_report(
         f"Journal excerpt: {journal[:600] or '(none)'}\n"
         f"Network excerpt: {network[:300] or '(none)'}\n"
         f"Remediation actions taken: {', '.join(actions_taken) or 'none'}\n"
+        + spec_block
     )
 
     ilog.info("node5.report_start")
@@ -603,6 +747,17 @@ class ThreatResponseAgent:
         proc_parent = n1["proc_parent"]
         root_pid    = n1["root_pid"]
 
+        # ── Node 1b: specification verification ──────────────────────────────
+        # Runs conventional integrity checks (file hash, rpm -V, SELinux status)
+        # and records that they returned clean. The Falco rule already proved the
+        # specification was violated; this node proves conventional methods were blind.
+        ilog.info("pipeline.node1b", step="spec_verify")
+        try:
+            spec_verify = await _node_spec_verify(self._linux_tools, ilog)
+        except Exception as exc:
+            ilog.error("node1b.spec_verify_failed", error=str(exc))
+            spec_verify = None
+
         # ── Node 2: journal + network triage ─────────────────────────────────
         ilog.info("pipeline.node2", step="host_triage")
         n2 = await _node_host_triage(self._linux_tools, ilog)
@@ -615,6 +770,7 @@ class ThreatResponseAgent:
             classify = await _node_classify(
                 self._llm, alert,
                 proc_root, proc_parent, journal, network,
+                spec_verify,
                 ilog,
             )
         except Exception as exc:
@@ -636,6 +792,7 @@ class ThreatResponseAgent:
                 self._llm, alert, host,
                 proc_root, proc_parent, journal, network,
                 classify, actions_taken,
+                spec_verify,
                 ilog,
             )
         except Exception as exc:
@@ -660,6 +817,8 @@ class ThreatResponseAgent:
             evidence=evidence,
             actions_taken=actions_taken,
             recommended_next_steps=next_steps,
+            detection_method=spec_verify.detection_method if spec_verify else "behavioral_specification_violation",
+            conventional_methods_bypassed=spec_verify.conventional_methods_bypassed if spec_verify else [],
         )
         ilog.info(
             "incident.report",

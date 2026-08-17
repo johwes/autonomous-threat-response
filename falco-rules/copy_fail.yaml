@@ -37,13 +37,25 @@
 
 - rule: Root Shell Spawned Directly by User Shell
   desc: >
-    Detects a root shell (uid=0) whose direct parent is a user-level
-    interactive shell. In legitimate su/sudo usage, the root shell's
-    parent is su or sudo. In Copy Fail (CVE-2026-31431) and Fragnesia
-    (CVE-2026-46300), the corrupted setuid binary calls execve() to
-    replace itself with a shell — so the root shell's parent is the
-    user's original bash/sh, not su. This parent-is-user-shell pattern
-    is the reliable post-exploitation fingerprint.
+    Specification violation: RHEL process ancestry invariant.
+
+    In a correctly specified RHEL environment, privilege elevation always
+    interposes su or sudo between a user shell and a root shell. A uid=0
+    shell whose direct parent is a user-level interactive shell is
+    architecturally impossible under the declared specification — it cannot
+    occur via any legitimate path.
+
+    This rule enforces that invariant. It fires on Copy Fail (CVE-2026-31431)
+    and Fragnesia (CVE-2026-46300) not because those CVEs are known, but
+    because both cause a setuid binary corrupted in the page cache to
+    execve()-replace itself with a shell, making a user shell the direct
+    parent of a root shell. The specification was violated. The attack is
+    detectable regardless of novelty.
+
+    Note: file integrity monitoring and rpm -V are structurally blind to
+    both CVEs. The attack corrupts /usr/bin/su in the kernel page cache
+    (in-memory) without touching the on-disk file. Only the behavioral
+    specification produces a signal.
   condition: >
     spawned_process and
     not container and
@@ -51,9 +63,9 @@
     proc.name in (bash, sh, dash, zsh, ksh, ksh93, tcsh, csh, fish, rbash, rzsh) and
     proc.pname in (bash, sh, dash, zsh, ksh, ksh93, tcsh, csh, fish, rbash, rzsh)
   output: >
-    Root shell spawned directly by user shell — possible LPE via page cache corruption
+    Root shell spawned directly by user shell — RHEL process ancestry invariant violated
     (user=%user.name uid=%user.uid pid=%proc.pid ppid=%proc.ppid
      comm=%proc.name parent=%proc.pname cmdline=%proc.cmdline
      pcmdline=%proc.pcmdline container=%container.name)
   priority: CRITICAL
-  tags: [CVE-2026-31431, CVE-2026-46300, copy_fail, fragnesia, lpe, page_cache]
+  tags: [CVE-2026-31431, CVE-2026-46300, copy_fail, fragnesia, lpe, page_cache, spec_deviation, rhel_invariant]
